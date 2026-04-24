@@ -1,0 +1,203 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap");
+
+@font-face {
+  font-family: "Aeonik";
+  src: url("https://cdn.prod.website-files.com/68ee2602962f766b40cafdeb/68ee2602962f766b40cafe13_aeonik-regular.woff2")
+    format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Aeonik";
+  src: url("https://cdn.prod.website-files.com/68ee2602962f766b40cafdeb/68ee2602962f766b40cafe12_aeonik-medium.woff2")
+    format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Aeonik";
+  src: url("https://cdn.prod.website-files.com/68ee2602962f766b40cafdeb/68ee2602962f766b40cafe14_aeonik-semibold.woff2")
+    format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --oa-bg: #f4eefb;
+  --oa-surface: #ffffff;
+  --oa-surface-soft: #faf7fe;
+  --oa-ink: #16142d;
+  --oa-muted: #5a5b6f;
+  --oa-border: #e4dcf0;
+  --oa-primary: #7d31d9;
+  --oa-primary-soft: #f3e9ff;
+  --oa-secondary: #ff8e8b;
+  --oa-navy: #080e36;
+  --oa-danger: #b42318;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: radial-gradient(circle at 5% 0%, #efe2ff 0%, var(--oa-bg) 36%, #f8f4ff 100%);
+  color: var(--oa-ink);
+  font-family: "Aeonik", "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.panel {
+  background: var(--oa-surface);
+  border: 1px solid var(--oa-border);
+  border-radius: 0.75rem;
+}
+
+@layer components {
+  .oa-page {
+    @apply min-h-screen bg-[radial-gradient(circle_at_0%_0%,rgba(237,184,255,0.25),transparent_30%),radial-gradient(circle_at_100%_0%,rgba(255,176,174,0.22),transparent_32%)];
+  }
+
+  .oa-card {
+    border: 1px solid var(--oa-border);
+    background: var(--oa-surface);
+    border-radius: 1rem;
+    box-shadow: 0 16px 40px -30px rgba(18, 13, 40, 0.55);
+  }
+
+  .oa-card-soft {
+    border: 1px solid #ece6f6;
+    background: var(--oa-surface-soft);
+    border-radius: 0.85rem;
+  }
+
+  .oa-title {
+    font-family: "Aeonik", "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+    letter-spacing: -0.01em;
+    color: var(--oa-ink);
+  }
+
+  .oa-subtext {
+    color: var(--oa-muted);
+  }
+
+  .oa-input,
+  .oa-select,
+  .oa-textarea {
+    width: 100%;
+    border: 1px solid #d9c3ef;
+    border-radius: 0.66rem;
+    background: #fff;
+    color: #1e1d35;
+    transition: border-color 140ms ease, box-shadow 140ms ease;
+  }
+
+  .oa-input:focus,
+  .oa-select:focus,
+  .oa-textarea:focus {
+    border-color: #a96adf;
+    outline: none;
+    box-shadow: 0 0 0 4px rgba(169, 106, 223, 0.18);
+  }
+
+  .oa-input {
+    @apply px-3 py-2.5 text-sm;
+  }
+
+  .oa-select {
+    @apply px-3 py-2.5 text-sm;
+  }
+
+  .oa-textarea {
+    @apply px-3 py-2.5 text-sm leading-6;
+  }
+
+  .oa-btn-primary {
+    border-radius: 0.66rem;
+    background: var(--oa-navy);
+    color: #fff;
+    transition: background-color 140ms ease, box-shadow 140ms ease;
+    box-shadow: 0 10px 24px -16px rgba(8, 14, 54, 0.95);
+  }
+
+  .oa-btn-primary:hover {
+    background: #111c58;
+  }
+
+  .oa-btn-secondary {
+    border-radius: 0.66rem;
+    border: 1px solid #cab4e4;
+    background: #fff;
+    color: #2b254f;
+    transition: background-color 140ms ease, border-color 140ms ease;
+  }
+
+  .oa-btn-secondary:hover {
+    background: #faf6ff;
+    border-color: #b99bde;
+  }
+
+  .oa-btn-quiet {
+    border-radius: 0.66rem;
+    border: 1px solid #ece5f6;
+    background: #f9f5ff;
+    color: #554f71;
+    transition: background-color 140ms ease;
+  }
+
+  .oa-btn-quiet:hover {
+    background: #f3ebff;
+  }
+
+  .oa-chip {
+    @apply inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium;
+    border: 1px solid #e6d9f6;
+    background: #f7f0ff;
+    color: #4f3f74;
+  }
+
+  .oa-divider {
+    border-color: #ece4f6;
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in {
+  animation: fadeIn 420ms ease-out both;
+}
+
+.animate-slide-up {
+  animation: slideUp 520ms ease-out both;
+}
