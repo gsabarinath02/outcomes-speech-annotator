@@ -15,12 +15,20 @@ import { TranscriptComparison } from "@/components/transcript-comparison";
 import {
   APIError,
   fetchAudioURL,
+  fetchPIILabels,
   fetchTask,
   fetchTaskActivity,
   patchTaskCombined,
+  startTask,
   type TaskActivityItem
 } from "@/lib/api";
 import { detectPIIAnnotations, sanitizePIIAnnotations } from "@/lib/pii";
+import {
+  fallbackPIILabels,
+  labelColor,
+  toPIILabelOptions,
+  type PIILabelOption,
+} from "@/lib/pii-labels";
 
 const statusOptions: TaskStatus[] = [
   "Not Started",
@@ -41,18 +49,6 @@ const inspectorTabs: Array<{ key: InspectorPanelKey; label: string }> = [
   { key: "activity", label: "Activity" },
   { key: "details", label: "Details" },
 ];
-
-const piiLabelOptions = [
-  "EMAIL",
-  "PHONE",
-  "SSN",
-  "CREDIT_CARD",
-  "IP_ADDRESS",
-  "URL",
-  "PERSON",
-  "ADDRESS",
-  "OTHER",
-] as const;
 
 type SaveState = "idle" | "unsaved" | "saving" | "saved" | "error";
 type SaveSectionKey = "transcript" | "metadata" | "notes" | "status" | "pii";
@@ -215,6 +211,7 @@ export default function TaskWorkspacePage() {
   const [sectionErrors, setSectionErrors] = useState<Record<string, string>>({});
   const [activity, setActivity] = useState<TaskActivityItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const [piiLabelOptions, setPiiLabelOptions] = useState<PIILabelOption[]>(fallbackPIILabels);
   const [conflict, setConflict] = useState<{
     open: boolean;
     serverTask: TaskDetail | null;
@@ -282,12 +279,29 @@ export default function TaskWorkspacePage() {
     async function loadTask() {
       setLoading(true);
       try {
-        const fetchedTask = await fetchTask(token, resolvedTaskId);
-        const signedAudio = await fetchAudioURL(token, resolvedTaskId);
-        const activityResponse = await fetchTaskActivity(token, resolvedTaskId);
+        const [fetchedTask, signedAudio, activityResponse] = await Promise.all([
+          fetchTask(token, resolvedTaskId),
+          fetchAudioURL(token, resolvedTaskId),
+          fetchTaskActivity(token, resolvedTaskId),
+        ]);
+        const labelsResponse = await fetchPIILabels(token).catch(() => ({ items: [] }));
         if (cancelled) return;
-        applyTaskState(fetchedTask);
-        setActivity(activityResponse.items);
+        let activeTask = fetchedTask;
+        let activeActivity = activityResponse.items;
+        let startError: string | null = null;
+        if (fetchedTask.status === "Not Started" && (user?.role === "ANNOTATOR" || user?.role === "REVIEWER")) {
+          try {
+            const startedTaskResponse = await startTask(token, resolvedTaskId);
+            activeTask = startedTaskResponse.task;
+            activeActivity = (await fetchTaskActivity(token, resolvedTaskId)).items;
+          } catch (err) {
+            startError = err instanceof APIError ? err.message : "Failed to start task";
+          }
+          if (cancelled) return;
+        }
+        applyTaskState(activeTask);
+        setActivity(activeActivity);
+        setPiiLabelOptions(toPIILabelOptions(labelsResponse.items));
         retryAttemptRef.current = 0;
         clearRetryTimer();
 
@@ -317,7 +331,7 @@ export default function TaskWorkspacePage() {
         }
 
         setAudioUrl(`${backendBase}${signedAudio.url}`);
-        setError(null);
+        setError(startError);
       } catch (err) {
         if (cancelled) return;
         setError(err instanceof APIError ? err.message : "Failed to load task");
@@ -330,7 +344,7 @@ export default function TaskWorkspacePage() {
     return () => {
       cancelled = true;
     };
-  }, [accessToken, taskId, backendBase, draftStorageKey]);
+  }, [accessToken, taskId, backendBase, draftStorageKey, user?.role]);
 
   useEffect(() => {
     if (!hasUnsavedChanges || !taskId) return;
@@ -339,6 +353,13 @@ export default function TaskWorkspacePage() {
     }, 1500);
     return () => window.clearTimeout(timeout);
   }, [hasUnsavedChanges, finalTranscript, piiAnnotations, metadata, customMetadata, notes, status, taskId]);
+
+  useEffect(() => {
+    if (piiLabelOptions.some((label) => label.key === selectionLabel)) {
+      return;
+    }
+    setSelectionLabel(piiLabelOptions[0]?.key ?? "OTHER");
+  }, [piiLabelOptions, selectionLabel]);
 
   useEffect(() => {
     hasUnsavedChangesRef.current = hasUnsavedChanges;
@@ -1130,10 +1151,11 @@ export default function TaskWorkspacePage() {
                   value={selectionLabel}
                   onChange={(event) => setSelectionLabel(event.target.value)}
                   className="oa-select min-w-[170px] py-1.5 text-sm"
+                  style={{ color: labelColor(selectionLabel, piiLabelOptions) }}
                 >
                   {piiLabelOptions.map((label) => (
-                    <option key={label} value={label}>
-                      {label}
+                    <option key={label.key} value={label.key}>
+                      {label.display_name}
                     </option>
                   ))}
                 </select>
@@ -1229,6 +1251,7 @@ export default function TaskWorkspacePage() {
                   setTranscriptSelection(null);
                   setSaveState("unsaved");
                 }}
+                labels={piiLabelOptions}
               />
             ) : null}
 

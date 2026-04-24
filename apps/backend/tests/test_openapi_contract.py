@@ -19,6 +19,7 @@ def test_openapi_and_shared_types_include_new_workflow_contracts():
     assert "/api/v1/tasks/{task_id}" in paths
     assert "patch" in paths["/api/v1/tasks/{task_id}"]
     assert "/api/v1/tasks/{task_id}/claim" in paths
+    assert "/api/v1/tasks/{task_id}/start" in paths
     assert "/api/v1/tasks/next/claim" in paths
     assert "/api/v1/tasks/bulk-assignee" in paths
     assert "/api/v1/tasks/{task_id}/activity" in paths

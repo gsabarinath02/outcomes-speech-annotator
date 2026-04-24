@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
@@ -13,6 +14,13 @@ class UserAdminResponse(BaseModel):
     full_name: str
     role: RoleEnum
     is_active: bool
+    last_login_at: datetime | None = None
+    last_activity_at: datetime | None = None
+    assigned_task_count: int = 0
+    open_assigned_task_count: int = 0
+    completed_task_count: int = 0
+    approved_task_count: int = 0
+    assignment_load: Literal["none", "light", "normal", "heavy"] = "none"
     created_at: datetime
     updated_at: datetime
 
@@ -45,3 +53,7 @@ class UpdateUserRequest(BaseModel):
         ):
             raise ValueError("At least one field must be provided")
         return self
+
+
+class ResetPasswordRequest(BaseModel):
+    password: str = Field(min_length=8, max_length=128)

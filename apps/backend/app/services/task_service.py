@@ -34,6 +34,8 @@ ALLOWED_STATUS_TRANSITIONS: dict[TaskStatusEnum, set[TaskStatusEnum]] = {
     TaskStatusEnum.APPROVED: {TaskStatusEnum.IN_PROGRESS},
 }
 
+AUTO_START_COMMENT = "Automatically moved to In Progress when work started"
+
 
 class TaskService:
     def __init__(self, db: Session):
@@ -148,6 +150,14 @@ class TaskService:
             return TaskPatchResponse(task=self._to_task_detail(task))
 
         self._mark_tagger(task, actor)
+        if "status" not in update_fields:
+            auto_started_from = self._auto_start_task_if_needed(task, actor)
+            if auto_started_from:
+                previous_values["status"] = auto_started_from.value
+                new_values["status"] = task.status.value
+                changed_fields.append("status")
+                old_status = auto_started_from
+                status_changed = True
         task = self.task_repo.save_task(task)
         if status_changed:
             self.task_repo.add_status_history(
@@ -155,7 +165,7 @@ class TaskService:
                 old_status=old_status,
                 new_status=task.status,
                 changed_by_id=actor.id,
-                comment=payload.comment,
+                comment=payload.comment if "status" in update_fields else AUTO_START_COMMENT,
             )
         self.task_repo.add_audit_log(
             task_id=task.id,
@@ -179,16 +189,24 @@ class TaskService:
         task = self._get_task_or_404(task_id)
         self._ensure_version(task, version, ["final_transcript"])
         previous = {"final_transcript": task.final_transcript}
+        new_values = {"final_transcript": final_transcript}
+        changed_fields = {"final_transcript": True}
         task.final_transcript = final_transcript
         self._mark_tagger(task, actor)
+        auto_started_from = self._auto_start_task_if_needed(task, actor)
+        if auto_started_from:
+            previous["status"] = auto_started_from.value
+            new_values["status"] = task.status.value
+            changed_fields["status"] = True
         task = self.task_repo.save_task(task)
+        self._add_auto_start_history_if_needed(task, actor, auto_started_from)
         self.task_repo.add_audit_log(
             task_id=task.id,
             actor_user_id=actor.id,
             action="UPDATE_TRANSCRIPT",
-            changed_fields={"final_transcript": True},
+            changed_fields=changed_fields,
             previous_values=previous,
-            new_values={"final_transcript": final_transcript},
+            new_values=new_values,
         )
         self.db.commit()
         return TaskPatchResponse(task=self._to_task_detail(task))
@@ -241,7 +259,13 @@ class TaskService:
             return TaskPatchResponse(task=self._to_task_detail(task))
 
         self._mark_tagger(task, actor)
+        auto_started_from = self._auto_start_task_if_needed(task, actor)
+        if auto_started_from:
+            previous_values["status"] = auto_started_from.value
+            new_values["status"] = task.status.value
+            changed_fields.append("status")
         task = self.task_repo.save_task(task)
+        self._add_auto_start_history_if_needed(task, actor, auto_started_from)
         self.task_repo.add_audit_log(
             task_id=task.id,
             actor_user_id=actor.id,
@@ -264,16 +288,24 @@ class TaskService:
         task = self._get_task_or_404(task_id)
         self._ensure_version(task, version, ["notes"])
         previous = {"notes": task.notes}
+        new_values = {"notes": notes}
+        changed_fields = {"notes": True}
         task.notes = notes
         self._mark_tagger(task, actor)
+        auto_started_from = self._auto_start_task_if_needed(task, actor)
+        if auto_started_from:
+            previous["status"] = auto_started_from.value
+            new_values["status"] = task.status.value
+            changed_fields["status"] = True
         task = self.task_repo.save_task(task)
+        self._add_auto_start_history_if_needed(task, actor, auto_started_from)
         self.task_repo.add_audit_log(
             task_id=task.id,
             actor_user_id=actor.id,
             action="UPDATE_NOTES",
-            changed_fields={"notes": True},
+            changed_fields=changed_fields,
             previous_values=previous,
-            new_values={"notes": notes},
+            new_values=new_values,
         )
         self.db.commit()
         return TaskPatchResponse(task=self._to_task_detail(task))
@@ -336,14 +368,22 @@ class TaskService:
 
         task.pii_annotations = normalized_annotations
         self._mark_tagger(task, actor)
+        new_values = {"pii_annotations": normalized_annotations}
+        changed_fields = {"pii_annotations": True}
+        auto_started_from = self._auto_start_task_if_needed(task, actor)
+        if auto_started_from:
+            previous["status"] = auto_started_from.value
+            new_values["status"] = task.status.value
+            changed_fields["status"] = True
         task = self.task_repo.save_task(task)
+        self._add_auto_start_history_if_needed(task, actor, auto_started_from)
         self.task_repo.add_audit_log(
             task_id=task.id,
             actor_user_id=actor.id,
             action="UPDATE_PII_ANNOTATIONS",
-            changed_fields={"pii_annotations": True},
+            changed_fields=changed_fields,
             previous_values=previous,
-            new_values={"pii_annotations": normalized_annotations},
+            new_values=new_values,
         )
         self.db.commit()
         return TaskPatchResponse(task=self._to_task_detail(task))
@@ -397,17 +437,26 @@ class TaskService:
         if task.assignee_id:
             raise ServiceError("Task is already assigned", status_code=409)
         task.assignee_id = actor.id
+        auto_started_from = self._auto_start_task_if_needed(task, actor)
         task = self.task_repo.save_task(task)
+        self._add_auto_start_history_if_needed(task, actor, auto_started_from)
         self.task_repo.add_audit_log(
             task_id=task.id,
             actor_user_id=actor.id,
             action="CLAIM_TASK",
-            changed_fields={"assignee_id": True},
-            previous_values={"assignee_id": None},
+            changed_fields={
+                "assignee_id": True,
+                **({"status": True} if auto_started_from else {}),
+            },
+            previous_values={
+                "assignee_id": None,
+                **({"status": auto_started_from.value} if auto_started_from else {}),
+            },
             new_values={
                 "assignee_id": actor.id,
                 "assignee_name": actor.full_name,
                 "assignee_email": actor.email,
+                **({"status": task.status.value} if auto_started_from else {}),
             },
         )
         self.db.commit()
@@ -418,6 +467,51 @@ class TaskService:
         if not task:
             return None
         return self.claim_task(task_id=task.id, actor=actor)
+
+    def start_task(self, *, task_id: str, actor: User) -> TaskPatchResponse:
+        task = self._get_task_or_404(task_id)
+        if task.status == TaskStatusEnum.APPROVED:
+            raise ServiceError("Approved tasks cannot be started", status_code=409)
+        if task.assignee_id and task.assignee_id != actor.id:
+            raise ServiceError("Task is assigned to another user", status_code=409)
+
+        changed_fields: dict[str, bool] = {}
+        previous_values: dict[str, Any] = {}
+        new_values: dict[str, Any] = {}
+
+        if task.assignee_id is None:
+            task.assignee_id = actor.id
+            changed_fields["assignee_id"] = True
+            previous_values["assignee_id"] = None
+            new_values.update(
+                {
+                    "assignee_id": actor.id,
+                    "assignee_name": actor.full_name,
+                    "assignee_email": actor.email,
+                }
+            )
+
+        auto_started_from = self._auto_start_task_if_needed(task, actor)
+        if auto_started_from:
+            changed_fields["status"] = True
+            previous_values["status"] = auto_started_from.value
+            new_values["status"] = task.status.value
+
+        if not changed_fields:
+            return TaskPatchResponse(task=self._to_task_detail(task))
+
+        task = self.task_repo.save_task(task)
+        self._add_auto_start_history_if_needed(task, actor, auto_started_from)
+        self.task_repo.add_audit_log(
+            task_id=task.id,
+            actor_user_id=actor.id,
+            action="START_TASK",
+            changed_fields=changed_fields,
+            previous_values=previous_values,
+            new_values=new_values,
+        )
+        self.db.commit()
+        return TaskPatchResponse(task=self._to_task_detail(task))
 
     def bulk_update_assignees(self, *, assignments: list[BulkAssigneeItem], actor: User) -> BulkAssigneeResponse:
         updated: list[BulkAssigneeUpdated] = []
@@ -581,6 +675,31 @@ class TaskService:
                 "Only reviewer/admin can move reviewed tasks back to In Progress",
                 status_code=403,
             )
+
+    def _auto_start_task_if_needed(self, task: AnnotationTask, actor: User) -> TaskStatusEnum | None:
+        if task.status != TaskStatusEnum.NOT_STARTED:
+            return None
+        if actor.role not in {RoleEnum.ANNOTATOR, RoleEnum.REVIEWER}:
+            return None
+        old_status = task.status
+        task.status = TaskStatusEnum.IN_PROGRESS
+        return old_status
+
+    def _add_auto_start_history_if_needed(
+        self,
+        task: AnnotationTask,
+        actor: User,
+        old_status: TaskStatusEnum | None,
+    ) -> None:
+        if not old_status:
+            return
+        self.task_repo.add_status_history(
+            task_id=task.id,
+            old_status=old_status,
+            new_status=task.status,
+            changed_by_id=actor.id,
+            comment=AUTO_START_COMMENT,
+        )
 
     def _mark_tagger(self, task: AnnotationTask, actor: User) -> None:
         task.last_tagger_id = actor.id

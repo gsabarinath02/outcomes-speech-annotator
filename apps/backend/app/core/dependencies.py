@@ -1,4 +1,5 @@
 from collections.abc import Generator
+from datetime import UTC, datetime
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
@@ -39,6 +40,9 @@ def get_current_user(
     user = db.get(User, user_id)
     if not user or not user.is_active:
         raise credentials_exception
+    user.last_activity_at = datetime.now(UTC)
+    db.commit()
+    db.refresh(user)
     return user
 
 

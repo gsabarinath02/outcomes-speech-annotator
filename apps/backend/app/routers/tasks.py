@@ -145,6 +145,19 @@ def claim_task(
         raise _http_error(exc) from exc
 
 
+@router.post("/{task_id}/start", response_model=TaskPatchResponse)
+def start_task(
+    task_id: str,
+    db: Session = Depends(get_db_session),
+    current_user: User = Depends(require_roles(RoleEnum.ANNOTATOR, RoleEnum.REVIEWER)),
+):
+    service = TaskService(db)
+    try:
+        return service.start_task(task_id=task_id, actor=current_user)
+    except ServiceError as exc:
+        raise _http_error(exc) from exc
+
+
 @router.get("/{task_id}/activity", response_model=TaskActivityResponse)
 def get_task_activity(
     task_id: str,

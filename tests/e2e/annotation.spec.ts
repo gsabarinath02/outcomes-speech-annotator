@@ -8,7 +8,7 @@ async function signIn(page: Page) {
   await page.getByLabel("Email").fill(ADMIN_EMAIL);
   await page.getByLabel("Password").fill(ADMIN_PASSWORD);
   await page.getByRole("button", { name: "Sign In" }).click();
-  await expect(page.getByText("Annotation Queue")).toBeVisible();
+  await expect(page.getByRole("link", { name: "Tasks" })).toBeVisible({ timeout: 15_000 });
 }
 
 test.describe("outcomes.ai speech annotator core flows", () => {
@@ -16,6 +16,14 @@ test.describe("outcomes.ai speech annotator core flows", () => {
     await signIn(page);
     await page.getByRole("link", { name: "Admin Upload" }).click();
     await expect(page.getByText("Upload Annotation Jobs")).toBeVisible();
+  });
+
+  test("admin can open metrics page", async ({ page }) => {
+    await signIn(page);
+    await page.getByRole("link", { name: "Metrics" }).click();
+    await expect(page.getByRole("heading", { name: "Metrics", exact: true })).toBeVisible();
+    await expect(page.getByText("Model Accuracy")).toBeVisible();
+    await expect(page.getByText("PII Label Management")).toBeVisible();
   });
 
   test("annotator task workspace shows transcript panels", async ({ page }) => {

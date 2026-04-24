@@ -1,0 +1,36 @@
+{
+  "id_column": "id",
+  "file_location_column": "file_location",
+  "transcript_columns": [
+    {
+      "source_key": "model_1",
+      "source_label": "Model 1",
+      "column_name": "model_1_transcript"
+    },
+    {
+      "source_key": "model_2",
+      "source_label": "Model 2",
+      "column_name": "model_2_transcript"
+    },
+    {
+      "source_key": "model_3",
+      "source_label": "Model 3",
+      "column_name": "model_3_transcript"
+    }
+  ],
+  "final_transcript_column": "corrected_transcript",
+  "notes_column": "notes",
+  "core_metadata_columns": {
+    "speaker_gender": "speaker_gender",
+    "speaker_role": "speaker_role",
+    "language": "language",
+    "channel": "channel",
+    "duration_seconds": "duration_seconds"
+  },
+  "custom_metadata_columns": [
+    "domain",
+    "region",
+    "queue_priority",
+    "expected_pii"
+  ]
+}

@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 from sqlalchemy.orm import Session
 
 from app.core.security import (
@@ -24,6 +26,11 @@ class AuthService:
         if user and verify_password(password, user.password_hash):
             if not user.is_active:
                 raise ServiceError("User account is inactive", status_code=403)
+            now = datetime.now(UTC)
+            user.last_login_at = now
+            user.last_activity_at = now
+            self.db.commit()
+            self.db.refresh(user)
             self.rate_limiter.reset(email, client_host)
             return self._build_token_response(user)
 

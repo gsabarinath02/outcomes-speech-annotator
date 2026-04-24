@@ -1,17 +1,13 @@
 import type { PIIAnnotation } from "@outcomes/shared-types";
-import { useCallback, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 
-const piiLabels = [
-  "EMAIL",
-  "PHONE",
-  "SSN",
-  "CREDIT_CARD",
-  "IP_ADDRESS",
-  "URL",
-  "PERSON",
-  "ADDRESS",
-  "OTHER"
-] as const;
+import {
+  labelColor,
+  labelDisplayName,
+  labelsWithAnnotationKeys,
+  toPIILabelOptions,
+  type PIILabelOption,
+} from "@/lib/pii-labels";
 
 interface PIIAnnotatorProps {
   transcript: string;
@@ -19,9 +15,8 @@ interface PIIAnnotatorProps {
   onChange: (annotations: PIIAnnotation[]) => void;
   onDetect: () => void;
   onClear: () => void;
+  labels?: PIILabelOption[];
 }
-
-type PiiLabel = (typeof piiLabels)[number];
 
 interface SelectedTranscriptRange {
   start: number;
@@ -77,7 +72,11 @@ function getSelectedTranscriptRange(
   return { start, end, text: transcript.slice(start, end) };
 }
 
-function renderHighlightedTranscript(transcript: string, annotations: PIIAnnotation[]) {
+function renderHighlightedTranscript(
+  transcript: string,
+  annotations: PIIAnnotation[],
+  labelOptions: PIILabelOption[]
+) {
   if (!transcript) {
     return <span className="text-[#7b7696]">No final transcript yet.</span>;
   }
@@ -98,8 +97,11 @@ function renderHighlightedTranscript(transcript: string, annotations: PIIAnnotat
     nodes.push(
       <mark
         key={`pii-${annotation.id}`}
-        className={`rounded px-0.5 ${labelColorClass(annotation.label)}`}
-        title={`${annotation.label}${annotation.confidence !== null ? ` (${Math.round(annotation.confidence * 100)}%)` : ""}`}
+        className="rounded border px-0.5"
+        style={labelColorStyle(annotation.label, labelOptions)}
+        title={`${labelDisplayName(annotation.label, labelOptions)}${
+          annotation.confidence !== null ? ` (${Math.round(annotation.confidence * 100)}%)` : ""
+        }`}
       >
         {transcript.slice(annotation.start, annotation.end)}
       </mark>
@@ -113,19 +115,13 @@ function renderHighlightedTranscript(transcript: string, annotations: PIIAnnotat
   return nodes;
 }
 
-function labelColorClass(label: string): string {
-  const colors: Record<string, string> = {
-    EMAIL: "bg-[#dbeafe] text-[#1d4ed8]",
-    PHONE: "bg-[#dcfce7] text-[#166534]",
-    SSN: "bg-[#fee2e2] text-[#991b1b]",
-    CREDIT_CARD: "bg-[#ffedd5] text-[#9a3412]",
-    IP_ADDRESS: "bg-[#e0e7ff] text-[#3730a3]",
-    URL: "bg-[#cffafe] text-[#0e7490]",
-    PERSON: "bg-[#fef9c3] text-[#854d0e]",
-    ADDRESS: "bg-[#f3e8ff] text-[#6b21a8]",
-    OTHER: "bg-[#e5e7eb] text-[#374151]",
+function labelColorStyle(label: string, labelOptions: PIILabelOption[]): CSSProperties {
+  const color = labelColor(label, labelOptions);
+  return {
+    backgroundColor: `${color}1f`,
+    borderColor: `${color}55`,
+    color,
   };
-  return colors[label] ?? colors.OTHER;
 }
 
 function overlappingIds(annotations: PIIAnnotation[]): Set<string> {
@@ -147,11 +143,24 @@ export function PIIAnnotator({
   onChange,
   onDetect,
   onClear,
+  labels,
 }: PIIAnnotatorProps) {
   const transcriptRef = useRef<HTMLDivElement>(null);
   const [selectedRange, setSelectedRange] = useState<SelectedTranscriptRange | null>(null);
-  const [newLabel, setNewLabel] = useState<PiiLabel>("PERSON");
+  const labelOptions = useMemo(() => toPIILabelOptions(labels), [labels]);
+  const annotationLabelOptions = useMemo(
+    () => labelsWithAnnotationKeys(labelOptions, annotations),
+    [annotations, labelOptions]
+  );
+  const [newLabel, setNewLabel] = useState("PERSON");
   const overlaps = overlappingIds(annotations);
+
+  useEffect(() => {
+    if (labelOptions.some((label) => label.key === newLabel)) {
+      return;
+    }
+    setNewLabel(labelOptions[0]?.key ?? "OTHER");
+  }, [labelOptions, newLabel]);
 
   const captureSelection = useCallback(() => {
     if (!transcriptRef.current) {
@@ -242,7 +251,7 @@ export function PIIAnnotator({
         onKeyUp={captureSelection}
         className="max-h-36 select-text overflow-auto rounded-lg border border-[#e5e7eb] bg-white px-3 py-2 text-sm leading-6 text-[#111827] focus:border-[#2563eb] focus:outline-none focus:ring-2 focus:ring-[#bfdbfe]"
       >
-        {renderHighlightedTranscript(transcript, annotations)}
+        {renderHighlightedTranscript(transcript, annotations, annotationLabelOptions)}
       </div>
 
       <div className="flex flex-wrap items-center gap-2 rounded-md border border-[#e5e7eb] bg-[#f8fafc] px-3 py-2">
@@ -259,12 +268,13 @@ export function PIIAnnotator({
           <select
             aria-label="New PII label"
             value={newLabel}
-            onChange={(event) => setNewLabel(event.target.value as PiiLabel)}
-            className={`oa-select py-1.5 text-xs ${labelColorClass(newLabel)}`}
+            onChange={(event) => setNewLabel(event.target.value)}
+            className="oa-select py-1.5 text-xs"
+            style={labelColorStyle(newLabel, labelOptions)}
           >
-            {piiLabels.map((label) => (
-              <option key={label} value={label}>
-                {label}
+            {labelOptions.map((label) => (
+              <option key={label.key} value={label.key}>
+                {label.display_name}
               </option>
             ))}
           </select>
@@ -298,11 +308,12 @@ export function PIIAnnotator({
                 onChange={(event) =>
                   updateAnnotation(annotation.id, { label: event.target.value })
                 }
-                className={`oa-select py-1.5 ${labelColorClass(annotation.label)}`}
+                className="oa-select py-1.5"
+                style={labelColorStyle(annotation.label, annotationLabelOptions)}
               >
-                {piiLabels.map((label) => (
-                  <option key={label} value={label}>
-                    {label}
+                {annotationLabelOptions.map((label) => (
+                  <option key={label.key} value={label.key}>
+                    {label.display_name}
                   </option>
                 ))}
               </select>
