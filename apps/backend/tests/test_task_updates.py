@@ -1,3 +1,8 @@
+from datetime import UTC, datetime
+
+from app.services.audio_alignment_service import AudioAlignmentService, transcript_hash
+
+
 def _mapping():
     return {
         "id_column": "id",
@@ -292,6 +297,102 @@ def test_pii_annotation_update(client, auth_headers, sample_excel_bytes):
     assert updated_task["pii_annotations"][0]["label"] == "EMAIL"
     assert updated_task["pii_annotations"][0]["value"] == "john.doe@test.com"
     assert updated_task["last_tagger_email"] == "annotator@test.com"
+
+
+def test_alignment_and_masked_audio_endpoints(client, auth_headers, sample_excel_bytes, monkeypatch, tmp_path):
+    task_id = _create_task(client, auth_headers, sample_excel_bytes)
+    detail = client.get(f"/api/v1/tasks/{task_id}", headers=auth_headers["annotator"]).json()
+    transcript_response = client.patch(
+        f"/api/v1/tasks/{task_id}/transcript",
+        headers=auth_headers["annotator"],
+        json={"version": detail["version"], "final_transcript": "Call John now"},
+    )
+    version = transcript_response.json()["task"]["version"]
+    pii_response = client.patch(
+        f"/api/v1/tasks/{task_id}/pii",
+        headers=auth_headers["annotator"],
+        json={
+            "version": version,
+            "pii_annotations": [
+                {
+                    "id": "pii-1",
+                    "label": "NAME",
+                    "start": 5,
+                    "end": 9,
+                    "value": "John",
+                    "source": "manual",
+                    "confidence": None,
+                }
+            ],
+        },
+    )
+    assert pii_response.status_code == 200
+
+    def fake_align(self, task, force=False):
+        words = [
+            {
+                "index": 0,
+                "text": "Call",
+                "normalized_text": "CALL",
+                "start_char": 0,
+                "end_char": 4,
+                "start_seconds": 0.0,
+                "end_seconds": 0.2,
+                "score": 0.96,
+            },
+            {
+                "index": 1,
+                "text": "John",
+                "normalized_text": "JOHN",
+                "start_char": 5,
+                "end_char": 9,
+                "start_seconds": 0.22,
+                "end_seconds": 0.5,
+                "score": 0.94,
+            },
+        ]
+        task.alignment_words = words
+        task.alignment_transcript_hash = transcript_hash(task.final_transcript or "")
+        task.alignment_model = "test-aligner"
+        task.alignment_updated_at = datetime.now(UTC)
+        return words
+
+    def fake_mask(self, task, force=False):
+        fake_path = tmp_path / "masked.wav"
+        fake_path.write_bytes(b"RIFFmasked")
+        task.alignment_words = fake_align(self, task, force=False)
+        task.masked_audio_location = str(fake_path)
+        task.masked_audio_pii_hash = "pii-hash"
+        task.masked_audio_updated_at = datetime.now(UTC)
+        return str(fake_path), [
+            {
+                "start_seconds": 0.18,
+                "end_seconds": 0.54,
+                "labels": ["NAME"],
+                "text": "John",
+            }
+        ]
+
+    monkeypatch.setattr(AudioAlignmentService, "align_task_audio", fake_align)
+    monkeypatch.setattr(AudioAlignmentService, "build_pii_masked_audio", fake_mask)
+
+    alignment = client.post(f"/api/v1/tasks/{task_id}/alignment", headers=auth_headers["annotator"])
+    assert alignment.status_code == 200
+    assert alignment.json()["words"][1]["text"] == "John"
+    assert alignment.json()["model"] == "test-aligner"
+
+    masked = client.post(f"/api/v1/tasks/{task_id}/mask-pii-audio", headers=auth_headers["annotator"])
+    assert masked.status_code == 200
+    payload = masked.json()
+    assert payload["masked_audio_url"].startswith("/api/v1/media/audio/")
+    assert payload["masked_intervals"] == [
+        {
+            "start_seconds": 0.18,
+            "end_seconds": 0.54,
+            "labels": ["NAME"],
+            "text": "John",
+        }
+    ]
 
 
 def test_admin_can_assign_task_to_user(client, auth_headers, sample_excel_bytes, seed_users):

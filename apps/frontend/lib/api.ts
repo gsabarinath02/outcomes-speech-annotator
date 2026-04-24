@@ -8,8 +8,10 @@ import type {
   PIILabelCreateRequest,
   PIILabelUpdateRequest,
   Role,
+  TaskAudioAlignmentResponse,
   TaskDetail,
   TaskListResponse,
+  TaskMaskedAudioResponse,
   TaskStatus,
   TokenResponse,
   UserStatusFilter,
@@ -178,6 +180,24 @@ export async function claimNextTask(token: string): Promise<{ task: TaskDetail }
 
 export async function fetchTaskActivity(token: string, taskId: string): Promise<{ items: TaskActivityItem[] }> {
   return request<{ items: TaskActivityItem[] }>(`/tasks/${taskId}/activity`, { method: "GET" }, token);
+}
+
+export async function generateTaskAlignment(
+  token: string,
+  taskId: string,
+  force = false
+): Promise<TaskAudioAlignmentResponse> {
+  const suffix = force ? "?force=true" : "";
+  return request<TaskAudioAlignmentResponse>(`/tasks/${taskId}/alignment${suffix}`, { method: "POST" }, token);
+}
+
+export async function maskTaskPIIAudio(
+  token: string,
+  taskId: string,
+  force = false
+): Promise<TaskMaskedAudioResponse> {
+  const suffix = force ? "?force=true" : "";
+  return request<TaskMaskedAudioResponse>(`/tasks/${taskId}/mask-pii-audio${suffix}`, { method: "POST" }, token);
 }
 
 export async function fetchAudioURL(

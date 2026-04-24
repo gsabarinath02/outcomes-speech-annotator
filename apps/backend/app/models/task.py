@@ -58,6 +58,13 @@ class AnnotationTask(Base, TimestampMixin):
     custom_metadata: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     original_row: Mapped[dict] = mapped_column(JSON, nullable=False)
     pii_annotations: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
+    alignment_words: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
+    alignment_transcript_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    alignment_model: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    alignment_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    masked_audio_location: Mapped[str | None] = mapped_column(Text, nullable=True)
+    masked_audio_pii_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    masked_audio_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     assignee_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True

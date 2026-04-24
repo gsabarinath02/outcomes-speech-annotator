@@ -10,6 +10,8 @@ from app.models.user import User
 from app.repositories.task_repository import TaskRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.task import (
+    AudioMaskInterval,
+    AudioAlignmentWord,
     BulkAssigneeError,
     BulkAssigneeItem,
     BulkAssigneeResponse,
@@ -18,11 +20,14 @@ from app.schemas.task import (
     PIIAnnotation,
     TaskActivityItem,
     TaskActivityResponse,
+    TaskAudioAlignmentResponse,
     TaskDetailResponse,
     TaskListItemResponse,
     TaskListResponse,
+    TaskMaskedAudioResponse,
     TaskPatchResponse,
 )
+from app.services.audio_alignment_service import AudioAlignmentService, transcript_hash
 from app.services.errors import ServiceError
 
 ALLOWED_STATUS_TRANSITIONS: dict[TaskStatusEnum, set[TaskStatusEnum]] = {
@@ -42,6 +47,7 @@ class TaskService:
         self.db = db
         self.task_repo = TaskRepository(db)
         self.user_repo = UserRepository(db)
+        self.audio_alignment_service = AudioAlignmentService()
 
     def list_tasks(
         self,
@@ -123,6 +129,8 @@ class TaskService:
                 new_values[field_name] = new_value
                 setattr(task, field_name, new_value)
                 changed_fields.append(field_name)
+                if field_name == "final_transcript":
+                    self._clear_audio_alignment(task)
 
         if "status" in update_fields:
             if payload.status is None:
@@ -145,6 +153,7 @@ class TaskService:
                 new_values["pii_annotations"] = normalized_annotations
                 task.pii_annotations = normalized_annotations
                 changed_fields.append("pii_annotations")
+                self._clear_masked_audio(task)
 
         if not changed_fields:
             return TaskPatchResponse(task=self._to_task_detail(task))
@@ -192,6 +201,7 @@ class TaskService:
         new_values = {"final_transcript": final_transcript}
         changed_fields = {"final_transcript": True}
         task.final_transcript = final_transcript
+        self._clear_audio_alignment(task)
         self._mark_tagger(task, actor)
         auto_started_from = self._auto_start_task_if_needed(task, actor)
         if auto_started_from:
@@ -367,6 +377,7 @@ class TaskService:
             return TaskPatchResponse(task=self._to_task_detail(task))
 
         task.pii_annotations = normalized_annotations
+        self._clear_masked_audio(task)
         self._mark_tagger(task, actor)
         new_values = {"pii_annotations": normalized_annotations}
         changed_fields = {"pii_annotations": True}
@@ -546,6 +557,53 @@ class TaskService:
         url = f"{settings.api_v1_prefix}/media/audio/{token}"
         return url, settings.audio_signing_expire_seconds
 
+    def generate_alignment(self, task_id: str, *, force: bool = False) -> TaskAudioAlignmentResponse:
+        task = self._get_task_or_404(task_id)
+        words = self.audio_alignment_service.align_task_audio(task, force=force)
+        self.db.flush()
+        self.db.commit()
+        return TaskAudioAlignmentResponse(
+            task_id=task.id,
+            transcript_hash=task.alignment_transcript_hash or transcript_hash(task.final_transcript or ""),
+            model=task.alignment_model or "unknown",
+            words=[AudioAlignmentWord(**word) for word in words],
+            generated_at=task.alignment_updated_at or datetime.now(UTC),
+        )
+
+    def generate_masked_pii_audio(self, task_id: str, *, actor: User, force: bool = False) -> TaskMaskedAudioResponse:
+        from itsdangerous import URLSafeTimedSerializer
+
+        from app.core.config import get_settings
+
+        task = self._get_task_or_404(task_id)
+        masked_audio_location, intervals = self.audio_alignment_service.build_pii_masked_audio(task, force=force)
+        self.task_repo.add_audit_log(
+            task_id=task.id,
+            actor_user_id=actor.id,
+            action="MASK_PII_AUDIO",
+            changed_fields={"masked_audio_location": True},
+            previous_values={},
+            new_values={
+                "masked_audio_location": masked_audio_location,
+                "masked_intervals": intervals,
+            },
+        )
+        self.db.flush()
+        self.db.commit()
+
+        settings = get_settings()
+        serializer = URLSafeTimedSerializer(settings.audio_signing_secret)
+        token = serializer.dumps({"task_id": task.id, "file_location": masked_audio_location, "masked": True})
+        url = f"{settings.api_v1_prefix}/media/audio/{token}"
+        return TaskMaskedAudioResponse(
+            task_id=task.id,
+            masked_audio_url=url,
+            expires_in_seconds=settings.audio_signing_expire_seconds,
+            masked_intervals=[AudioMaskInterval(**interval) for interval in intervals],
+            words=[AudioAlignmentWord(**word) for word in task.alignment_words],
+            generated_at=task.masked_audio_updated_at or datetime.now(UTC),
+        )
+
     def _get_task_or_404(self, task_id: str) -> AnnotationTask:
         task = self.task_repo.get_task(task_id)
         if not task:
@@ -580,6 +638,11 @@ class TaskService:
             updated_at=task.updated_at,
             last_saved_at=task.last_saved_at,
             transcript_variants=task.transcript_variants,
+            alignment_words=task.alignment_words or [],
+            alignment_model=task.alignment_model,
+            alignment_updated_at=task.alignment_updated_at,
+            masked_audio_available=bool(task.masked_audio_location),
+            masked_audio_updated_at=task.masked_audio_updated_at,
             prev_task_id=prev_task_id,
             next_task_id=next_task_id,
         )
@@ -703,3 +766,15 @@ class TaskService:
 
     def _mark_tagger(self, task: AnnotationTask, actor: User) -> None:
         task.last_tagger_id = actor.id
+
+    def _clear_audio_alignment(self, task: AnnotationTask) -> None:
+        task.alignment_words = []
+        task.alignment_transcript_hash = None
+        task.alignment_model = None
+        task.alignment_updated_at = None
+        self._clear_masked_audio(task)
+
+    def _clear_masked_audio(self, task: AnnotationTask) -> None:
+        task.masked_audio_location = None
+        task.masked_audio_pii_hash = None
+        task.masked_audio_updated_at = None

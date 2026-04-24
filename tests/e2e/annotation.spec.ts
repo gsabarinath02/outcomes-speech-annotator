@@ -5,10 +5,22 @@ const ADMIN_PASSWORD = process.env.E2E_ADMIN_PASSWORD ?? "Admin@123";
 
 async function signIn(page: Page) {
   await page.goto("/login");
-  await page.getByLabel("Email").fill(ADMIN_EMAIL);
+  await submitCredentials(page);
+  const navigated = await page.waitForURL(/\/tasks/, { timeout: 30_000 }).then(
+    () => true,
+    () => false
+  );
+  if (!navigated && (await page.getByRole("button", { name: "Sign In" }).isVisible())) {
+    await submitCredentials(page);
+    await page.waitForURL(/\/tasks/, { timeout: 30_000 });
+  }
+  await expect(page.getByRole("link", { name: "Tasks" })).toBeVisible({ timeout: 30_000 });
+}
+
+async function submitCredentials(page: Page) {
+  await page.getByLabel("Work Email").fill(ADMIN_EMAIL);
   await page.getByLabel("Password").fill(ADMIN_PASSWORD);
   await page.getByRole("button", { name: "Sign In" }).click();
-  await expect(page.getByRole("link", { name: "Tasks" })).toBeVisible({ timeout: 15_000 });
 }
 
 test.describe("outcomes.ai speech annotator core flows", () => {

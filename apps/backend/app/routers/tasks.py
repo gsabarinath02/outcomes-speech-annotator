@@ -12,8 +12,10 @@ from app.schemas.task import (
     BulkAssigneeResponse,
     CombinedTaskUpdateRequest,
     TaskActivityResponse,
+    TaskAudioAlignmentResponse,
     TaskDetailResponse,
     TaskListResponse,
+    TaskMaskedAudioResponse,
     TaskNextResponse,
     TaskPatchResponse,
     UpdateAssigneeRequest,
@@ -167,6 +169,34 @@ def get_task_activity(
     service = TaskService(db)
     try:
         return service.get_activity(task_id)
+    except ServiceError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/{task_id}/alignment", response_model=TaskAudioAlignmentResponse)
+def generate_task_alignment(
+    task_id: str,
+    force: bool = Query(default=False),
+    db: Session = Depends(get_db_session),
+    _: User = Depends(get_current_user),
+):
+    service = TaskService(db)
+    try:
+        return service.generate_alignment(task_id, force=force)
+    except ServiceError as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/{task_id}/mask-pii-audio", response_model=TaskMaskedAudioResponse)
+def mask_task_pii_audio(
+    task_id: str,
+    force: bool = Query(default=False),
+    db: Session = Depends(get_db_session),
+    current_user: User = Depends(get_current_user),
+):
+    service = TaskService(db)
+    try:
+        return service.generate_masked_pii_audio(task_id, actor=current_user, force=force)
     except ServiceError as exc:
         raise _http_error(exc) from exc
 

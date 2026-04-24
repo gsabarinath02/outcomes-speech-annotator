@@ -6,13 +6,25 @@ import TaskWorkspacePage from "@/app/(dashboard)/tasks/[taskId]/page";
 
 const draftKey = "outcomes-ai:speech-annotator:draft:annotator-1:task-1";
 
-const { push, fetchTask, fetchAudioURL, fetchPIILabels, fetchTaskActivity, patchTaskCombined, startTask } = vi.hoisted(
+const {
+  push,
+  fetchTask,
+  fetchAudioURL,
+  fetchPIILabels,
+  fetchTaskActivity,
+  generateTaskAlignment,
+  maskTaskPIIAudio,
+  patchTaskCombined,
+  startTask,
+} = vi.hoisted(
   () => ({
     push: vi.fn(),
     fetchTask: vi.fn(),
     fetchAudioURL: vi.fn(),
     fetchPIILabels: vi.fn(),
     fetchTaskActivity: vi.fn(),
+    generateTaskAlignment: vi.fn(),
+    maskTaskPIIAudio: vi.fn(),
     patchTaskCombined: vi.fn(),
     startTask: vi.fn()
   })
@@ -42,6 +54,11 @@ const mockTask = {
   created_at: new Date().toISOString(),
   updated_at: new Date().toISOString(),
   last_saved_at: new Date().toISOString(),
+  alignment_words: [],
+  alignment_model: null,
+  alignment_updated_at: null,
+  masked_audio_available: false,
+  masked_audio_updated_at: null,
   transcript_variants: [
     {
       id: "tv-1",
@@ -86,6 +103,8 @@ vi.mock("@/lib/api", () => ({
   fetchAudioURL: (...args: unknown[]) => fetchAudioURL(...args),
   fetchPIILabels: (...args: unknown[]) => fetchPIILabels(...args),
   fetchTaskActivity: (...args: unknown[]) => fetchTaskActivity(...args),
+  generateTaskAlignment: (...args: unknown[]) => generateTaskAlignment(...args),
+  maskTaskPIIAudio: (...args: unknown[]) => maskTaskPIIAudio(...args),
   patchTaskCombined: (...args: unknown[]) => patchTaskCombined(...args),
   startTask: (...args: unknown[]) => startTask(...args)
 }));
@@ -98,6 +117,32 @@ describe("TaskWorkspacePage", () => {
     fetchAudioURL.mockResolvedValue({ url: "/api/v1/media/audio/token", expires_in_seconds: 300 });
     fetchPIILabels.mockResolvedValue({ items: [] });
     fetchTaskActivity.mockResolvedValue({ items: [] });
+    generateTaskAlignment.mockResolvedValue({
+      task_id: "task-1",
+      transcript_hash: "hash",
+      model: "test-aligner",
+      generated_at: new Date().toISOString(),
+      words: [
+        {
+          index: 0,
+          text: "hello",
+          normalized_text: "HELLO",
+          start_char: 0,
+          end_char: 5,
+          start_seconds: 0,
+          end_seconds: 0.4,
+          score: 0.95,
+        },
+      ],
+    });
+    maskTaskPIIAudio.mockResolvedValue({
+      task_id: "task-1",
+      masked_audio_url: "/api/v1/media/audio/masked-token",
+      expires_in_seconds: 300,
+      generated_at: new Date().toISOString(),
+      masked_intervals: [{ start_seconds: 0, end_seconds: 0.4, labels: ["PHONE"], text: "1234567890" }],
+      words: [],
+    });
     patchTaskCombined.mockResolvedValue({ task: { ...mockTask, version: 2 } });
     startTask.mockResolvedValue({
       task: {
@@ -333,5 +378,39 @@ describe("TaskWorkspacePage", () => {
     });
 
     expect(push).toHaveBeenCalledWith("/tasks/task-2");
+  });
+
+  it("generates alignment for word playback", async () => {
+    render(<TaskWorkspacePage />);
+    await screen.findByText("Task OUT-001");
+
+    fireEvent.change(screen.getByLabelText("Final Transcript"), {
+      target: { value: "hello world" },
+    });
+    fireEvent.click(screen.getAllByRole("button", { name: "Align Words" })[0]);
+
+    await waitFor(() => expect(generateTaskAlignment).toHaveBeenCalledWith("test-token", "task-1", false));
+    expect(await screen.findByRole("button", { name: "hello" })).toBeInTheDocument();
+  });
+
+  it("saves pii annotations and generates masked audio preview", async () => {
+    render(<TaskWorkspacePage />);
+    await screen.findByText("Task OUT-001");
+
+    const textarea = screen.getByLabelText("Final Transcript") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "my phone 1234567890" } });
+    act(() => {
+      textarea.setSelectionRange(9, 19);
+      fireEvent.select(textarea);
+    });
+    fireEvent.change(screen.getByLabelText("Inline PII Label"), {
+      target: { value: "PHONE" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Add Label To Selection/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Mask PII" }));
+
+    await waitFor(() => expect(patchTaskCombined).toHaveBeenCalled());
+    await waitFor(() => expect(maskTaskPIIAudio).toHaveBeenCalledWith("test-token", "task-1", false));
+    expect(await screen.findByText("Masked Audio Preview")).toBeInTheDocument();
   });
 });

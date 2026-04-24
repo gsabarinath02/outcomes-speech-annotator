@@ -42,6 +42,24 @@ export interface PIIAnnotation {
   confidence: number | null;
 }
 
+export interface AudioAlignmentWord {
+  index: number;
+  text: string;
+  normalized_text: string;
+  start_char: number;
+  end_char: number;
+  start_seconds: number;
+  end_seconds: number;
+  score: number | null;
+}
+
+export interface AudioMaskInterval {
+  start_seconds: number;
+  end_seconds: number;
+  labels: string[];
+  text: string;
+}
+
 export interface PIILabel {
   id: string;
   key: string;
@@ -97,6 +115,11 @@ export interface TaskDetail {
   updated_at: string;
   last_saved_at: string | null;
   transcript_variants: TranscriptVariant[];
+  alignment_words: AudioAlignmentWord[];
+  alignment_model: string | null;
+  alignment_updated_at: string | null;
+  masked_audio_available: boolean;
+  masked_audio_updated_at: string | null;
   prev_task_id: string | null;
   next_task_id: string | null;
 }
@@ -200,6 +223,23 @@ export interface JobStatus {
   updated_at: string;
   started_at: string | null;
   completed_at: string | null;
+}
+
+export interface TaskAudioAlignmentResponse {
+  task_id: string;
+  transcript_hash: string;
+  model: string;
+  words: AudioAlignmentWord[];
+  generated_at: string;
+}
+
+export interface TaskMaskedAudioResponse {
+  task_id: string;
+  masked_audio_url: string;
+  expires_in_seconds: number;
+  masked_intervals: AudioMaskInterval[];
+  words: AudioAlignmentWord[];
+  generated_at: string;
 }
 
 export interface MetricsFilters {

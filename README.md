@@ -29,6 +29,7 @@ tests/
 - Upload Excel datasets, preview rows, map columns, validate inputs, and import tasks.
 - Compare multiple ASR transcript variants and highlight model disagreement.
 - Edit final transcript, notes, core metadata, custom metadata, and PII spans.
+- Force-align corrected transcript words to audio, play individual words, and generate masked PII audio for review.
 - Track task lifecycle across assignment, annotation, review, completion, and rejection.
 - Save work automatically with optimistic concurrency conflict resolution.
 - Export the latest corrected dataset as CSV or XLSX.
@@ -45,6 +46,13 @@ tests/
 ```bash
 cp .env.example .env
 docker compose up --build
+```
+
+Forced alignment uses Wav2Vec2 through Torch/Torchaudio. The Docker backend and worker images install the CPU alignment dependencies by default. For a smaller local image when audio masking is not needed:
+
+```bash
+INSTALL_ALIGNMENT_DEPS=false docker compose build backend worker
+docker compose up
 ```
 
 Open:
@@ -76,6 +84,7 @@ cd apps/backend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+pip install -r requirements-alignment.txt  # enables Wav2Vec2 forced alignment
 alembic upgrade head
 uvicorn app.main:app --reload --port 8000
 ```

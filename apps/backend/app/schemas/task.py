@@ -60,6 +60,38 @@ class PIIAnnotation(BaseModel):
         return self
 
 
+class AudioAlignmentWord(BaseModel):
+    index: int = Field(ge=0)
+    text: str
+    normalized_text: str
+    start_char: int = Field(ge=0)
+    end_char: int = Field(ge=0)
+    start_seconds: float = Field(ge=0)
+    end_seconds: float = Field(ge=0)
+    score: float | None = Field(default=None, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_alignment_span(self) -> "AudioAlignmentWord":
+        if self.end_char < self.start_char:
+            raise ValueError("end_char must be greater than or equal to start_char")
+        if self.end_seconds < self.start_seconds:
+            raise ValueError("end_seconds must be greater than or equal to start_seconds")
+        return self
+
+
+class AudioMaskInterval(BaseModel):
+    start_seconds: float = Field(ge=0)
+    end_seconds: float = Field(ge=0)
+    labels: list[str] = Field(default_factory=list)
+    text: str = ""
+
+    @model_validator(mode="after")
+    def validate_audio_interval(self) -> "AudioMaskInterval":
+        if self.end_seconds <= self.start_seconds:
+            raise ValueError("end_seconds must be greater than start_seconds")
+        return self
+
+
 class TaskDetailResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -88,6 +120,11 @@ class TaskDetailResponse(BaseModel):
     updated_at: datetime
     last_saved_at: datetime | None
     transcript_variants: list[TranscriptVariantResponse]
+    alignment_words: list[AudioAlignmentWord] = Field(default_factory=list)
+    alignment_model: str | None = None
+    alignment_updated_at: datetime | None = None
+    masked_audio_available: bool = False
+    masked_audio_updated_at: datetime | None = None
     prev_task_id: str | None = None
     next_task_id: str | None = None
 
@@ -209,3 +246,20 @@ class TaskNextResponse(BaseModel):
 class AudioURLResponse(BaseModel):
     url: str
     expires_in_seconds: int
+
+
+class TaskAudioAlignmentResponse(BaseModel):
+    task_id: str
+    transcript_hash: str
+    model: str
+    words: list[AudioAlignmentWord]
+    generated_at: datetime
+
+
+class TaskMaskedAudioResponse(BaseModel):
+    task_id: str
+    masked_audio_url: str
+    expires_in_seconds: int
+    masked_intervals: list[AudioMaskInterval]
+    words: list[AudioAlignmentWord]
+    generated_at: datetime

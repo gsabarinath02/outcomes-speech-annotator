@@ -39,6 +39,11 @@ describe("ConflictModal", () => {
           updated_at: new Date().toISOString(),
           last_saved_at: new Date().toISOString(),
           transcript_variants: [],
+          alignment_words: [],
+          alignment_model: null,
+          alignment_updated_at: null,
+          masked_audio_available: false,
+          masked_audio_updated_at: null,
           prev_task_id: null,
           next_task_id: null
         }}

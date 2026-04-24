@@ -1,6 +1,6 @@
 "use client";
 
-import type { PIIAnnotation, TaskDetail, TaskStatus } from "@outcomes/shared-types";
+import type { AudioAlignmentWord, AudioMaskInterval, PIIAnnotation, TaskDetail, TaskStatus } from "@outcomes/shared-types";
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 
@@ -18,6 +18,8 @@ import {
   fetchPIILabels,
   fetchTask,
   fetchTaskActivity,
+  generateTaskAlignment,
+  maskTaskPIIAudio,
   patchTaskCombined,
   startTask,
   type TaskActivityItem
@@ -240,7 +242,17 @@ export default function TaskWorkspacePage() {
   const hasUnsavedChangesRef = useRef(false);
   const retryTimeoutRef = useRef<number | null>(null);
   const retryAttemptRef = useRef(0);
-  const saveAllRef = useRef<(versionOverride?: number) => Promise<void>>(async () => undefined);
+  const saveAllRef = useRef<(versionOverride?: number) => Promise<boolean>>(async () => false);
+  const wordAudioRef = useRef<HTMLAudioElement | null>(null);
+  const wordStopAtRef = useRef<number | null>(null);
+  const wordStopTimerRef = useRef<number | null>(null);
+  const [alignmentWords, setAlignmentWords] = useState<AudioAlignmentWord[]>([]);
+  const [alignmentBusy, setAlignmentBusy] = useState(false);
+  const [alignmentMessage, setAlignmentMessage] = useState<string | null>(null);
+  const [maskedAudioUrl, setMaskedAudioUrl] = useState<string | null>(null);
+  const [maskedIntervals, setMaskedIntervals] = useState<AudioMaskInterval[]>([]);
+  const [maskingBusy, setMaskingBusy] = useState(false);
+  const [activeWordIndex, setActiveWordIndex] = useState<number | null>(null);
 
   const hasUnsavedChanges = transcriptDirty || metadataDirty || notesDirty || statusDirty || piiDirty;
   const draftStorageKey = taskId ? buildDraftKey(taskId, user?.id) : null;
@@ -370,6 +382,17 @@ export default function TaskWorkspacePage() {
   }, [finalTranscript, originalTranscript]);
 
   useEffect(() => {
+    if (finalTranscript === originalTranscript) return;
+    if (alignmentWords.length > 0) {
+      setAlignmentWords([]);
+      setAlignmentMessage("Transcript changed. Re-run alignment before word playback or masking.");
+      setMaskedAudioUrl(null);
+      setMaskedIntervals([]);
+      setActiveWordIndex(null);
+    }
+  }, [alignmentWords.length, finalTranscript, originalTranscript]);
+
+  useEffect(() => {
     setPiiAnnotations((prev) => {
       const sanitized = sanitizePIIAnnotations(finalTranscript, prev);
       if (JSON.stringify(sanitized) === JSON.stringify(prev)) {
@@ -491,6 +514,7 @@ export default function TaskWorkspacePage() {
   useEffect(
     () => () => {
       clearRetryTimer();
+      clearWordStopTimer();
     },
     []
   );
@@ -577,6 +601,11 @@ export default function TaskWorkspacePage() {
     setCustomMetadata(nextCustomMetadata);
     setPiiAnnotations(nextPIIAnnotations);
     setTranscriptSelection(null);
+    setAlignmentWords(nextTask.alignment_words ?? []);
+    setAlignmentMessage(nextTask.alignment_words?.length ? null : "Align the transcript to enable word playback.");
+    setMaskedAudioUrl(null);
+    setMaskedIntervals([]);
+    setActiveWordIndex(null);
 
     setOriginalTranscript(nextTranscript);
     setOriginalNotes(nextTask.notes ?? "");
@@ -618,6 +647,13 @@ export default function TaskWorkspacePage() {
     }
   }
 
+  function clearWordStopTimer() {
+    if (wordStopTimerRef.current) {
+      window.clearTimeout(wordStopTimerRef.current);
+      wordStopTimerRef.current = null;
+    }
+  }
+
   function clearLocalDraft() {
     if (!draftStorageKey) return;
     try {
@@ -642,11 +678,11 @@ export default function TaskWorkspacePage() {
     setError(`Save failed. Retrying in ${Math.round(delay / 1000)}s.`);
   }
 
-  async function saveAll(versionOverride?: number) {
-    if (!accessToken || !taskId || savingRef.current) return;
+  async function saveAll(versionOverride?: number): Promise<boolean> {
+    if (!accessToken || !taskId || savingRef.current) return false;
     const token: string = accessToken;
     const resolvedTaskId: string = taskId;
-    if (!hasUnsavedChanges && !versionOverride) return;
+    if (!hasUnsavedChanges && !versionOverride) return true;
 
     savingRef.current = true;
     setSaveState("saving");
@@ -695,7 +731,7 @@ export default function TaskWorkspacePage() {
         retryAttemptRef.current = 0;
         clearLocalDraft();
         setDraftState({ mode: "none", savedAt: null });
-        return;
+        return true;
       }
 
       const response = await patchTaskCombined(token, resolvedTaskId, payload);
@@ -709,6 +745,7 @@ export default function TaskWorkspacePage() {
       setDraftState({ mode: "none", savedAt: null });
       const activityResponse = await fetchTaskActivity(token, resolvedTaskId);
       setActivity(activityResponse.items);
+      return true;
     } catch (err) {
       if (err instanceof APIError && err.status === 409) {
         const detail = (err.payload as { detail?: { server_task?: TaskDetail; conflicting_fields?: string[] } })
@@ -740,6 +777,7 @@ export default function TaskWorkspacePage() {
           retryAttemptRef.current = 0;
         }
       }
+      return false;
     } finally {
       savingRef.current = false;
     }
@@ -897,6 +935,115 @@ export default function TaskWorkspacePage() {
     const sanitized = sanitizePIIAnnotations(finalTranscript, annotations);
     setPiiAnnotations(sanitized);
     setSaveState("unsaved");
+  }
+
+  async function handleGenerateAlignment(force = false) {
+    if (!accessToken || !taskId) return false;
+    const saved = await saveAll();
+    if (!saved) {
+      setAlignmentMessage("Save the current transcript and PII edits before alignment.");
+      return false;
+    }
+    setAlignmentBusy(true);
+    setAlignmentMessage(null);
+    setError(null);
+    try {
+      const response = await generateTaskAlignment(accessToken, taskId, force);
+      setAlignmentWords(response.words);
+      setAlignmentMessage(`Aligned ${response.words.length} transcript words.`);
+      return true;
+    } catch (err) {
+      const message = err instanceof APIError ? err.message : "Forced alignment failed";
+      setAlignmentMessage(message);
+      setError(message);
+      return false;
+    } finally {
+      setAlignmentBusy(false);
+    }
+  }
+
+  async function handleMaskPIIAudio(force = false) {
+    if (!accessToken || !taskId) return;
+    if (piiAnnotations.length === 0) {
+      setError("Add at least one PII annotation before masking audio.");
+      return;
+    }
+    const saved = await saveAll();
+    if (!saved) {
+      setError("Save the current PII annotations before masking audio.");
+      return;
+    }
+    setMaskingBusy(true);
+    setAlignmentMessage(null);
+    setError(null);
+    try {
+      const response = await maskTaskPIIAudio(accessToken, taskId, force);
+      setAlignmentWords(response.words);
+      setMaskedIntervals(response.masked_intervals);
+      setMaskedAudioUrl(`${backendBase}${response.masked_audio_url}`);
+      setAlignmentMessage(`Masked ${response.masked_intervals.length} audio span${response.masked_intervals.length === 1 ? "" : "s"}.`);
+    } catch (err) {
+      const message = err instanceof APIError ? err.message : "PII audio masking failed";
+      setAlignmentMessage(message);
+      setError(message);
+    } finally {
+      setMaskingBusy(false);
+    }
+  }
+
+  function handleWordAudioTimeUpdate() {
+    const audio = wordAudioRef.current;
+    if (!audio || wordStopAtRef.current === null) return;
+    if (audio.currentTime >= wordStopAtRef.current) {
+      audio.pause();
+      clearWordStopTimer();
+      wordStopAtRef.current = null;
+      setActiveWordIndex(null);
+    }
+  }
+
+  function playAlignedWord(word: AudioAlignmentWord) {
+    const audio = wordAudioRef.current;
+    if (!audio || !audioUrl) return;
+    const startSeconds = Math.max(0, word.start_seconds);
+    const endSeconds = Math.max(startSeconds + 0.05, word.end_seconds);
+    const durationMs = Math.max(80, (endSeconds - startSeconds) * 1000);
+
+    clearWordStopTimer();
+    setActiveWordIndex(word.index);
+    audio.pause();
+
+    const cleanupPlayback = () => {
+      clearWordStopTimer();
+      wordStopAtRef.current = null;
+      setActiveWordIndex(null);
+    };
+
+    const startPlayback = () => {
+      try {
+        audio.currentTime = startSeconds;
+      } catch {
+        cleanupPlayback();
+        return;
+      }
+      wordStopAtRef.current = endSeconds;
+      wordStopTimerRef.current = window.setTimeout(() => {
+        audio.pause();
+        cleanupPlayback();
+      }, durationMs + 80);
+      void audio.play().catch(cleanupPlayback);
+    };
+
+    const sourceChanged = audio.src !== audioUrl;
+    if (sourceChanged) {
+      audio.src = audioUrl;
+    }
+    if (!sourceChanged && audio.readyState >= HTMLMediaElement.HAVE_METADATA) {
+      startPlayback();
+      return;
+    }
+    audio.addEventListener("loadedmetadata", startPlayback, { once: true });
+    audio.load();
   }
 
   function handleRestoreLocalDraft() {
@@ -1106,11 +1253,53 @@ export default function TaskWorkspacePage() {
           <div className="oa-card p-4">
             <div className="mb-3 flex items-center justify-between gap-2">
               <h3 className="oa-title text-sm font-semibold uppercase tracking-[0.1em] text-[#4b5563]">Audio</h3>
-              <span className="rounded-full border border-[#e5e7eb] bg-[#f8fafc] px-2.5 py-1 text-[11px] text-[#64748b]">
-                Playback + Review
-              </span>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => void handleGenerateAlignment(false)}
+                  disabled={alignmentBusy || maskingBusy || !finalTranscript.trim()}
+                  className="oa-btn-secondary px-3 py-1.5 text-xs font-medium disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {alignmentBusy ? "Aligning..." : "Align Words"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleMaskPIIAudio(false)}
+                  disabled={alignmentBusy || maskingBusy || piiAnnotations.length === 0}
+                  className="oa-btn-primary px-3 py-1.5 text-xs font-medium disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {maskingBusy ? "Masking..." : "Mask PII"}
+                </button>
+              </div>
             </div>
             <AudioWaveformPlayer audioUrl={audioUrl} />
+            {alignmentMessage ? (
+              <p className="mt-2 rounded-lg border border-[#e5e7eb] bg-[#f8fafc] px-3 py-2 text-xs text-[#4b5563]">
+                {alignmentMessage}
+              </p>
+            ) : null}
+            {maskedAudioUrl ? (
+              <div className="mt-3 rounded-xl border border-[#d7eadf] bg-[#f1fbf5] p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-xs font-semibold uppercase tracking-[0.08em] text-[#266544]">Masked Audio Preview</p>
+                  <span className="text-xs text-[#266544]">
+                    {maskedIntervals.length} masked span{maskedIntervals.length === 1 ? "" : "s"}
+                  </span>
+                </div>
+                <audio controls preload="metadata" className="mt-2 w-full">
+                  <source src={maskedAudioUrl} />
+                </audio>
+                {maskedIntervals.length > 0 ? (
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {maskedIntervals.map((interval, index) => (
+                      <span key={`${interval.start_seconds}-${interval.end_seconds}-${index}`} className="rounded-full border border-[#bfe5cb] bg-white px-2 py-0.5 text-xs text-[#266544]">
+                        {interval.labels.join(", ")} {interval.start_seconds.toFixed(2)}s-{interval.end_seconds.toFixed(2)}s
+                      </span>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
           </div>
 
           <div className="oa-card p-4 sm:p-5">
@@ -1134,6 +1323,55 @@ export default function TaskWorkspacePage() {
               rows={14}
               className="oa-textarea min-h-[460px] bg-white font-mono text-[15px]"
             />
+            <div className="mt-3 rounded-xl border border-[#e5e7eb] bg-[#fbfcfe] p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs font-semibold uppercase tracking-[0.08em] text-[#4b5563]">Word Audio Check</p>
+                <button
+                  type="button"
+                  onClick={() => void handleGenerateAlignment(false)}
+                  disabled={alignmentBusy || maskingBusy || !finalTranscript.trim()}
+                  className="oa-btn-secondary px-3 py-1.5 text-xs font-medium disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {alignmentBusy ? "Aligning..." : alignmentWords.length ? "Refresh Alignment" : "Align Words"}
+                </button>
+              </div>
+              {alignmentWords.length > 0 ? (
+                <div className="mt-2 max-h-32 overflow-auto rounded-lg border border-[#e5e7eb] bg-white p-2">
+                  <div className="flex flex-wrap gap-1.5">
+                    {alignmentWords.map((word) => (
+                      <button
+                        key={`${word.index}-${word.start_char}-${word.end_char}`}
+                        type="button"
+                        onClick={() => playAlignedWord(word)}
+                        className={`rounded-md border px-2 py-1 text-xs font-medium transition ${
+                          activeWordIndex === word.index
+                            ? "border-[#241f43] bg-[#241f43] text-white"
+                            : "border-[#e5e7eb] bg-[#f8fafc] text-[#374151] hover:border-[#c7d2fe] hover:bg-[#eef2ff]"
+                        }`}
+                        title={`${word.start_seconds.toFixed(2)}s - ${word.end_seconds.toFixed(2)}s`}
+                      >
+                        {word.text}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <p className="mt-2 rounded-lg border border-dashed border-[#d1d5db] px-3 py-3 text-sm text-[#6b7280]">
+                  Run forced alignment to play individual transcript words from the original audio.
+                </p>
+              )}
+              <audio
+                ref={wordAudioRef}
+                preload="metadata"
+                className="hidden"
+                onTimeUpdate={handleWordAudioTimeUpdate}
+                onEnded={() => {
+                  clearWordStopTimer();
+                  wordStopAtRef.current = null;
+                  setActiveWordIndex(null);
+                }}
+              />
+            </div>
             <div className="mt-3 rounded-xl border border-[#e5e7eb] bg-[#f8fafc] p-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <p className="text-xs font-semibold uppercase tracking-[0.08em] text-[#4b5563]">Inline PII Label</p>

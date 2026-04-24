@@ -9,7 +9,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
+COPY requirements-alignment.txt /app/requirements-alignment.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
+ARG INSTALL_ALIGNMENT_DEPS=true
+RUN if [ "$INSTALL_ALIGNMENT_DEPS" = "true" ]; then pip install --no-cache-dir -r /app/requirements-alignment.txt; fi
 
 COPY . /app
 
