@@ -1,0 +1,26 @@
+services:
+  backend:
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"]
+    volumes:
+      - ./apps/backend:/app
+      - backend_uploads:/app/data/uploads
+
+  worker:
+    volumes:
+      - ./apps/backend:/app
+      - backend_uploads:/app/data/uploads
+
+  frontend:
+    build:
+      context: .
+      dockerfile: apps/frontend/Dockerfile
+      target: deps
+    working_dir: /workspace/apps/frontend
+    command: ["npm", "run", "dev", "--", "--hostname", "0.0.0.0"]
+    volumes:
+      - ./apps/frontend:/workspace/apps/frontend
+      - ./packages/shared-types:/workspace/packages/shared-types
+      - frontend_node_modules:/workspace/apps/frontend/node_modules
+
+volumes:
+  frontend_node_modules:
