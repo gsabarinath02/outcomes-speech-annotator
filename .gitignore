@@ -1,0 +1,42 @@
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+**/.venv/
+**/.venv2/
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.coverage
+**/coverage.xml
+htmlcov/
+*.py[cod]
+
+# Node and Next.js
+**/node_modules/
+**/.next/
+**/dist/
+**/build/
+**/.turbo/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local runtime data
+postgres_data/
+redis_data/
+backend_uploads/
+apps/backend/data/
+
+# Editor metadata
+.idea/
+.vscode/
