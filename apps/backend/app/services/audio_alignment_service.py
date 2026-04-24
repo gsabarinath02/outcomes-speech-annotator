@@ -261,8 +261,9 @@ class AudioAlignmentService:
         bundle = torchaudio.pipelines.WAV2VEC2_ASR_BASE_960H
         labels = bundle.get_labels()
         dictionary = {label: index for index, label in enumerate(labels)}
-        transcript = "|" + "|".join(word.normalized_text for word in words) + "|"
-        missing = sorted({char for char in transcript if char not in dictionary})
+        full_transcript = "|" + "|".join(word.normalized_text for word in words) + "|"
+        compact_transcript = "|" + "".join(word.normalized_text for word in words)
+        missing = sorted({char for char in full_transcript if char not in dictionary})
         if missing:
             raise ServiceError(
                 "Transcript contains characters unsupported by the alignment model",
@@ -270,12 +271,11 @@ class AudioAlignmentService:
                 extra={"unsupported_characters": missing},
             )
 
-        tokens = [dictionary[char] for char in transcript]
         model = self._get_model(bundle)
         device = next(model.parameters()).device
 
         with self._materialized_audio_path(file_location) as audio_path:
-            waveform, sample_rate = torchaudio.load(str(audio_path))
+            waveform, sample_rate = self._load_waveform(audio_path, torch, torchaudio)
 
         if waveform.size(0) > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
@@ -288,10 +288,25 @@ class AudioAlignmentService:
             emissions = torch.log_softmax(emissions, dim=-1)
         emission = emissions[0].cpu()
 
+        transcript = full_transcript
+        tokens = [dictionary[char] for char in transcript]
+        compact_alignment = False
+        if len(tokens) > emission.size(0):
+            compact_tokens = [dictionary[char] for char in compact_transcript]
+            if len(compact_tokens) > emission.size(0):
+                raise ServiceError(
+                    "Transcript is too long for this audio to force-align. Check that the transcript matches the audio.",
+                    status_code=422,
+                    extra={"alignment_tokens": len(tokens), "audio_frames": emission.size(0)},
+                )
+            transcript = compact_transcript
+            tokens = compact_tokens
+            compact_alignment = True
+
         trellis = _get_trellis(torch, emission, tokens, blank_id=0)
         path = _backtrack(emission, trellis, tokens, blank_id=0)
         token_segments = _merge_repeats(path, transcript)
-        word_segments = _merge_words(token_segments)
+        word_segments = _merge_compact_words(token_segments, words) if compact_alignment else _merge_words(token_segments)
 
         if len(word_segments) != len(words):
             raise ServiceError(
@@ -339,6 +354,60 @@ class AudioAlignmentService:
             model.eval()
             _MODEL_CACHE["model"] = model
         return _MODEL_CACHE["model"]
+
+    def _load_waveform(self, path: Path, torch, torchaudio):
+        if path.suffix.lower() == ".wav":
+            try:
+                return self._load_wav_with_stdlib(path, torch)
+            except (EOFError, ValueError, wave.Error):
+                # Fall through to torchaudio for uncommon WAV encodings when a decoder is available.
+                pass
+
+        try:
+            return torchaudio.load(str(path))
+        except Exception as exc:
+            raise ServiceError(
+                "Audio decoding failed. Upload a PCM WAV file or configure TorchCodec/FFmpeg support for this audio format.",
+                status_code=422,
+            ) from exc
+
+    def _load_wav_with_stdlib(self, path: Path, torch):
+        with wave.open(str(path), "rb") as wav_file:
+            channels = wav_file.getnchannels()
+            sample_width = wav_file.getsampwidth()
+            sample_rate = wav_file.getframerate()
+            frame_count = wav_file.getnframes()
+            compression = wav_file.getcomptype()
+            frames = wav_file.readframes(frame_count)
+
+        if compression != "NONE":
+            raise ValueError("Compressed WAV files require an audio decoder")
+        if channels <= 0 or sample_rate <= 0:
+            raise ValueError("Invalid WAV channel or sample rate")
+
+        buffer = bytearray(frames)
+        if sample_width == 1:
+            samples = torch.frombuffer(buffer, dtype=torch.uint8).to(torch.float32)
+            samples = (samples - 128.0) / 128.0
+        elif sample_width == 2:
+            samples = torch.frombuffer(buffer, dtype=torch.int16).to(torch.float32) / 32768.0
+        elif sample_width == 3:
+            values = []
+            for offset in range(0, len(buffer), 3):
+                raw_value = int.from_bytes(buffer[offset : offset + 3], byteorder="little", signed=False)
+                if raw_value & 0x800000:
+                    raw_value -= 0x1000000
+                values.append(raw_value / 8388608.0)
+            samples = torch.tensor(values, dtype=torch.float32)
+        elif sample_width == 4:
+            samples = torch.frombuffer(buffer, dtype=torch.int32).to(torch.float32) / 2147483648.0
+        else:
+            raise ValueError("Unsupported WAV sample width")
+
+        if samples.numel() % channels != 0:
+            raise ValueError("WAV sample count is not divisible by channel count")
+        waveform = samples.reshape(-1, channels).transpose(0, 1).contiguous()
+        return waveform, sample_rate
 
     def _materialized_audio_path(self, file_location: str):
         location = self.audio_resolver.resolve(file_location)
@@ -518,4 +587,36 @@ def _merge_words(segments: list[_Segment], separator: str = "|") -> list[_Segmen
             end_index = start_index
         else:
             end_index += 1
+    return words
+
+
+def _merge_compact_words(
+    segments: list[_Segment],
+    transcript_words: list[TranscriptWord],
+    separator: str = "|",
+) -> list[_Segment]:
+    character_segments = [segment for segment in segments if segment.label != separator]
+    words: list[_Segment] = []
+    start_index = 0
+    for transcript_word in transcript_words:
+        end_index = start_index + len(transcript_word.normalized_text)
+        word_segments = character_segments[start_index:end_index]
+        if len(word_segments) != len(transcript_word.normalized_text):
+            raise ServiceError("Forced alignment produced incomplete word timings", status_code=422)
+        total_length = sum(segment.length for segment in word_segments)
+        if total_length <= 0:
+            raise ServiceError("Forced alignment produced zero-length word timings", status_code=422)
+        score = sum(segment.score * segment.length for segment in word_segments) / total_length
+        words.append(
+            _Segment(
+                label="".join(segment.label for segment in word_segments),
+                start=word_segments[0].start,
+                end=word_segments[-1].end,
+                score=score,
+            )
+        )
+        start_index = end_index
+
+    if start_index != len(character_segments):
+        raise ServiceError("Forced alignment produced extra character timings", status_code=422)
     return words

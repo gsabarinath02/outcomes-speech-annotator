@@ -1,7 +1,9 @@
 import math
 import struct
 import wave
+from types import SimpleNamespace
 
+import pytest
 from app.services.audio_alignment_service import (
     AudioAlignmentService,
     MaskInterval,
@@ -57,6 +59,27 @@ def test_pii_mask_intervals_cover_aligned_words_and_merge_overlaps():
     assert round(intervals[0].end_seconds, 2) == 0.84
     assert intervals[0].labels == ["NAME"]
     assert intervals[0].text == "John / Doe"
+
+
+def test_alignment_loads_pcm_wav_without_torchcodec(tmp_path):
+    torch = pytest.importorskip("torch")
+    source_path = tmp_path / "source.wav"
+    sample_rate = 8000
+    samples = [0, 8192, -8192, 16384]
+    with wave.open(str(source_path), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(sample_rate)
+        writer.writeframes(b"".join(struct.pack("<h", sample) for sample in samples))
+
+    torchaudio = SimpleNamespace(load=lambda _: (_ for _ in ()).throw(AssertionError("torchaudio.load used")))
+    waveform, loaded_sample_rate = AudioAlignmentService()._load_waveform(source_path, torch, torchaudio)
+
+    assert loaded_sample_rate == sample_rate
+    assert tuple(waveform.shape) == (1, len(samples))
+    assert waveform[0, 0].item() == 0
+    assert round(waveform[0, 1].item(), 2) == 0.25
+    assert round(waveform[0, 2].item(), 2) == -0.25
 
 
 def test_wav_masking_silences_only_selected_audio(tmp_path):
