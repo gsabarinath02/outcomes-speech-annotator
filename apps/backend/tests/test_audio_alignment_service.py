@@ -6,7 +6,9 @@ from types import SimpleNamespace
 import pytest
 from app.services.audio_alignment_service import (
     AudioAlignmentService,
+    AlignedWord,
     MaskInterval,
+    _refine_aligned_word_boundaries,
     build_mask_intervals,
     tokenize_transcript_words,
 )
@@ -80,6 +82,33 @@ def test_alignment_loads_pcm_wav_without_torchcodec(tmp_path):
     assert waveform[0, 0].item() == 0
     assert round(waveform[0, 1].item(), 2) == 0.25
     assert round(waveform[0, 2].item(), 2) == -0.25
+
+
+def test_alignment_refines_word_boundaries_to_local_speech_energy():
+    torch = pytest.importorskip("torch")
+    sample_rate = 1000
+    waveform = torch.zeros(sample_rate)
+    waveform[220:640] = 0.5
+
+    refined = _refine_aligned_word_boundaries(
+        [
+            AlignedWord(
+                index=0,
+                text="hello",
+                normalized_text="HELLO",
+                start_char=0,
+                end_char=5,
+                start_seconds=0.0,
+                end_seconds=0.9,
+                score=0.8,
+            )
+        ],
+        waveform,
+        sample_rate,
+    )
+
+    assert 0.18 <= refined[0].start_seconds <= 0.23
+    assert 0.63 <= refined[0].end_seconds <= 0.69
 
 
 def test_wav_masking_silences_only_selected_audio(tmp_path):

@@ -5,7 +5,7 @@ import re
 import shutil
 import tempfile
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -19,6 +19,12 @@ settings = get_settings()
 
 ALIGNMENT_MODEL_NAME = "torchaudio.WAV2VEC2_ASR_BASE_960H"
 MASK_PADDING_SECONDS = 0.04
+ALIGNMENT_ENERGY_MARGIN_SECONDS = 0.025
+ALIGNMENT_ENERGY_SEARCH_PADDING_SECONDS = 0.12
+ALIGNMENT_ENERGY_FRAME_SECONDS = 0.02
+ALIGNMENT_ENERGY_HOP_SECONDS = 0.01
+ALIGNMENT_ENERGY_THRESHOLD_RATIO = 0.12
+ALIGNMENT_MIN_WORD_SECONDS = 0.04
 
 
 @dataclass(frozen=True)
@@ -332,7 +338,7 @@ class AudioAlignmentService:
                     score=segment.score,
                 )
             )
-        return aligned
+        return _refine_aligned_word_boundaries(aligned, waveform[0].cpu(), sample_rate)
 
     def _load_torch_audio(self):
         try:
@@ -620,3 +626,104 @@ def _merge_compact_words(
     if start_index != len(character_segments):
         raise ServiceError("Forced alignment produced extra character timings", status_code=422)
     return words
+
+
+def _refine_aligned_word_boundaries(
+    words: list[AlignedWord],
+    waveform,
+    sample_rate: int,
+) -> list[AlignedWord]:
+    if not words or sample_rate <= 0:
+        return words
+
+    audio = waveform.detach().cpu()
+    if audio.dim() > 1:
+        audio = audio.mean(dim=0)
+    if audio.numel() == 0:
+        return words
+
+    duration_seconds = audio.numel() / float(sample_rate)
+    refined: list[AlignedWord] = []
+    for index, word in enumerate(words):
+        raw_start = max(0.0, min(word.start_seconds, duration_seconds))
+        raw_end = max(raw_start, min(word.end_seconds, duration_seconds))
+        search_start = max(0.0, raw_start - ALIGNMENT_ENERGY_SEARCH_PADDING_SECONDS)
+        search_end = min(duration_seconds, raw_end + ALIGNMENT_ENERGY_SEARCH_PADDING_SECONDS)
+
+        if index > 0:
+            previous = words[index - 1]
+            if previous.end_seconds < raw_start:
+                search_start = max(search_start, (previous.end_seconds + raw_start) / 2)
+            else:
+                search_start = max(search_start, raw_start)
+        if index + 1 < len(words):
+            next_word = words[index + 1]
+            if raw_end < next_word.start_seconds:
+                search_end = min(search_end, (raw_end + next_word.start_seconds) / 2)
+            else:
+                search_end = min(search_end, raw_end)
+
+        energy_span = _find_local_energy_span(audio, sample_rate, search_start, search_end)
+        if energy_span is None:
+            refined.append(word)
+            continue
+
+        energy_start, energy_end = energy_span
+        start_seconds = max(search_start, energy_start - ALIGNMENT_ENERGY_MARGIN_SECONDS)
+        end_seconds = min(search_end, energy_end + ALIGNMENT_ENERGY_MARGIN_SECONDS)
+        if end_seconds - start_seconds < ALIGNMENT_MIN_WORD_SECONDS:
+            refined.append(word)
+            continue
+        refined.append(replace(word, start_seconds=start_seconds, end_seconds=end_seconds))
+
+    return _enforce_monotonic_word_boundaries(refined)
+
+
+def _find_local_energy_span(waveform, sample_rate: int, start_seconds: float, end_seconds: float) -> tuple[float, float] | None:
+    start_sample = max(0, int(math.floor(start_seconds * sample_rate)))
+    end_sample = min(waveform.numel(), int(math.ceil(end_seconds * sample_rate)))
+    if end_sample <= start_sample:
+        return None
+
+    segment = waveform[start_sample:end_sample].abs()
+    if segment.numel() == 0:
+        return None
+
+    frame_size = max(1, int(round(ALIGNMENT_ENERGY_FRAME_SECONDS * sample_rate)))
+    hop_size = max(1, int(round(ALIGNMENT_ENERGY_HOP_SECONDS * sample_rate)))
+    if segment.numel() < frame_size:
+        peak = float(segment.max().item())
+        return (start_seconds, end_seconds) if peak > 0 else None
+
+    frames = segment.unfold(0, frame_size, hop_size)
+    rms = (frames.pow(2).mean(dim=1)).sqrt()
+    peak = float(rms.max().item())
+    if peak <= 0:
+        return None
+
+    threshold = max(peak * ALIGNMENT_ENERGY_THRESHOLD_RATIO, 0.0025)
+    active = (rms >= threshold).nonzero(as_tuple=False).flatten()
+    if active.numel() == 0:
+        return None
+
+    first_frame = int(active[0].item())
+    last_frame = int(active[-1].item())
+    energy_start = (start_sample + first_frame * hop_size) / float(sample_rate)
+    energy_end = (start_sample + last_frame * hop_size + frame_size) / float(sample_rate)
+    return energy_start, min(end_seconds, energy_end)
+
+
+def _enforce_monotonic_word_boundaries(words: list[AlignedWord]) -> list[AlignedWord]:
+    if len(words) < 2:
+        return words
+
+    adjusted = list(words)
+    for index in range(len(adjusted) - 1):
+        current = adjusted[index]
+        next_word = adjusted[index + 1]
+        if current.end_seconds <= next_word.start_seconds:
+            continue
+        midpoint = (current.end_seconds + next_word.start_seconds) / 2
+        adjusted[index] = replace(current, end_seconds=max(current.start_seconds, midpoint))
+        adjusted[index + 1] = replace(next_word, start_seconds=min(next_word.end_seconds, midpoint))
+    return adjusted
