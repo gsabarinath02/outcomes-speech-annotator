@@ -1,0 +1,88 @@
+from datetime import datetime
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from app.models.enums import UploadJobStatusEnum
+
+
+class TranscriptColumnMapping(BaseModel):
+    source_key: str = Field(min_length=1, max_length=100)
+    column_name: str = Field(min_length=1, max_length=255)
+    source_label: str | None = Field(default=None, max_length=150)
+
+
+class ColumnMappingRequest(BaseModel):
+    id_column: str
+    file_location_column: str
+    transcript_columns: list[TranscriptColumnMapping]
+    final_transcript_column: str | None = None
+    notes_column: str | None = None
+    status_column: str | None = None
+    core_metadata_columns: dict[str, str] = Field(default_factory=dict)
+    custom_metadata_columns: list[str] | None = None
+
+    @model_validator(mode="after")
+    def validate_transcripts(self) -> "ColumnMappingRequest":
+        if not self.transcript_columns:
+            raise ValueError("At least one transcript column is required")
+        return self
+
+
+class UploadFileResponse(BaseModel):
+    id: str
+    upload_job_id: str
+    filename: str
+    status: UploadJobStatusEnum
+
+
+class PreviewResponse(BaseModel):
+    upload_job_id: str
+    columns: list[str]
+    sample_rows: list[dict[str, Any]]
+    row_count: int
+
+
+class RowValidationError(BaseModel):
+    row_number: int
+    field_name: str | None = None
+    error_message: str
+    raw_value: str | None = None
+
+
+class ValidationGateResult(BaseModel):
+    gate_key: str
+    status: str
+    message: str
+    checked_count: int | None = None
+    failed_count: int | None = None
+
+
+class UploadValidationResult(BaseModel):
+    upload_job_id: str
+    status: UploadJobStatusEnum
+    valid_rows: int
+    invalid_rows: int
+    total_rows: int
+    transcript_sources: list[str]
+    custom_metadata_columns: list[str]
+    import_allowed: bool
+    gates: list[ValidationGateResult]
+    errors: list[RowValidationError]
+
+
+class UploadImportResult(BaseModel):
+    upload_job_id: str
+    imported_tasks: int
+    skipped_rows: int
+    status: UploadJobStatusEnum
+
+
+class UploadJobErrorResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    row_number: int
+    field_name: str | None
+    error_message: str
+    raw_value: str | None
+    created_at: datetime

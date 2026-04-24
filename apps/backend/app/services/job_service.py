@@ -1,0 +1,175 @@
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from sqlalchemy.orm import Session
+
+from app.core.config import get_settings
+from app.core.database import SessionLocal
+from app.models.job import BackgroundJob
+from app.models.user import User
+from app.schemas.job import ExportJobRequest
+from app.schemas.upload import ColumnMappingRequest
+from app.services.errors import ServiceError
+from app.services.export_service import ExportService
+from app.services.upload_service import UploadService
+
+
+class JobService:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def enqueue_export_job(self, payload: ExportJobRequest, actor: User) -> BackgroundJob:
+        job = self._create_job(
+            job_type="export",
+            payload=payload.model_dump(mode="json"),
+            actor=actor,
+        )
+        self._dispatch(job)
+        self.db.refresh(job)
+        return job
+
+    def enqueue_import_job(
+        self,
+        *,
+        upload_job_id: str,
+        mapping: ColumnMappingRequest | None,
+        actor: User,
+    ) -> BackgroundJob:
+        job = self._create_job(
+            job_type="import",
+            payload={
+                "upload_job_id": upload_job_id,
+                "mapping": mapping.model_dump(mode="json") if mapping else None,
+            },
+            actor=actor,
+        )
+        self._dispatch(job)
+        self.db.refresh(job)
+        return job
+
+    def get_job(self, job_id: str) -> BackgroundJob:
+        job = self.db.get(BackgroundJob, job_id)
+        if not job:
+            raise ServiceError("Background job not found", status_code=404)
+        return job
+
+    def download_job_output(self, job_id: str) -> tuple[bytes, str, str]:
+        job = self.get_job(job_id)
+        if job.status != "COMPLETED":
+            raise ServiceError("Background job is not complete", status_code=409)
+        if not job.output_path:
+            raise ServiceError("Background job does not have a downloadable output", status_code=404)
+
+        output_path = Path(job.output_path)
+        if not output_path.exists():
+            raise ServiceError("Background job output is no longer available", status_code=404)
+        return output_path.read_bytes(), job.content_type or "application/octet-stream", output_path.name
+
+    def run_job(self, job_id: str) -> None:
+        job = self.get_job(job_id)
+        if job.status not in {"QUEUED", "FAILED"}:
+            return
+
+        job.status = "RUNNING"
+        job.started_at = datetime.now(UTC)
+        job.error_message = None
+        self.db.commit()
+
+        try:
+            result = self._execute_job(job_id)
+            job = self.get_job(job_id)
+            job.status = "COMPLETED"
+            job.result = result
+            job.completed_at = datetime.now(UTC)
+            self.db.commit()
+        except Exception as exc:
+            self.db.rollback()
+            job = self.get_job(job_id)
+            job.status = "FAILED"
+            job.error_message = str(exc)
+            job.completed_at = datetime.now(UTC)
+            self.db.commit()
+
+    def _create_job(self, *, job_type: str, payload: dict[str, Any], actor: User) -> BackgroundJob:
+        job = BackgroundJob(
+            job_type=job_type,
+            status="QUEUED",
+            payload=payload,
+            created_by_id=actor.id,
+        )
+        self.db.add(job)
+        self.db.commit()
+        self.db.refresh(job)
+        return job
+
+    def _dispatch(self, job: BackgroundJob) -> None:
+        settings = get_settings()
+        if settings.jobs_inline:
+            self.run_job(job.id)
+            return
+
+        try:
+            from redis import Redis
+            from rq import Queue
+        except ImportError as exc:
+            raise ServiceError("Background queue dependencies are not installed", status_code=503) from exc
+
+        redis_conn = Redis.from_url(settings.redis_url)
+        queue = Queue("speech-annotator", connection=redis_conn)
+        queue.enqueue("app.services.job_service.run_queued_job", job.id)
+
+    def _execute_job(self, job_id: str) -> dict[str, Any]:
+        job = self.get_job(job_id)
+        if job.job_type == "export":
+            return self._execute_export(job)
+        if job.job_type == "import":
+            return self._execute_import(job)
+        raise ServiceError(f"Unsupported background job type: {job.job_type}", status_code=422)
+
+    def _execute_export(self, job: BackgroundJob) -> dict[str, Any]:
+        payload = ExportJobRequest.model_validate(job.payload)
+        export_format = payload.format
+        content, content_type = ExportService(self.db).export_tasks(
+            job_id=payload.job_id,
+            export_format=export_format,
+            status=payload.status,
+            assignee_id=payload.assignee_id,
+            language=payload.language,
+            date_from=payload.date_from,
+            date_to=payload.date_to,
+        )
+
+        output_dir = get_settings().upload_path / "exports"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"annotations_export_{job.id}.{export_format}"
+        output_path = output_dir / filename
+        output_path.write_bytes(content)
+
+        job.output_path = str(output_path)
+        job.content_type = content_type
+        self.db.flush()
+        return {
+            "filename": filename,
+            "format": export_format,
+            "content_type": content_type,
+            "bytes": len(content),
+        }
+
+    def _execute_import(self, job: BackgroundJob) -> dict[str, Any]:
+        upload_job_id = job.payload.get("upload_job_id")
+        if not upload_job_id:
+            raise ServiceError("Import job is missing upload_job_id", status_code=422)
+
+        raw_mapping = job.payload.get("mapping")
+        mapping = ColumnMappingRequest.model_validate(raw_mapping) if raw_mapping else None
+        result = UploadService(self.db).import_upload(upload_job_id, mapping)
+        return result.model_dump(mode="json")
+
+
+def run_queued_job(job_id: str) -> None:
+    db = SessionLocal()
+    try:
+        JobService(db).run_job(job_id)
+    finally:
+        db.close()

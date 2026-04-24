@@ -1,0 +1,617 @@
+import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Any, Literal
+
+from fastapi import UploadFile
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.core.config import get_settings
+from app.models.enums import TaskStatusEnum, UploadJobStatusEnum
+from app.models.user import User
+from app.repositories.task_repository import TaskRepository
+from app.repositories.upload_repository import UploadRepository
+from app.schemas.upload import (
+    ColumnMappingRequest,
+    PreviewResponse,
+    RowValidationError,
+    UploadFileResponse,
+    UploadImportResult,
+    UploadValidationResult,
+    ValidationGateResult,
+)
+from app.services.errors import ServiceError
+from app.storage.audio_resolver import AudioResolver
+from app.utils.excel import dataframe_preview, load_excel_as_dataframe, normalize_cell
+
+settings = get_settings()
+ALLOWED_CORE_METADATA_FIELDS = {"speaker_gender", "speaker_role", "language", "channel", "duration_seconds"}
+AUDIO_VALIDATION_SAMPLE_SIZE = 12
+AUDIO_VALIDATION_FAIL_RATIO = 0.5
+MIN_ROWS_WITH_ANY_TRANSCRIPT_RATIO = 0.8
+GateStatus = Literal["pass", "warning", "fail"]
+
+
+@dataclass
+class QuickValidationGate:
+    gate_key: str
+    status: GateStatus
+    message: str
+    checked_count: int | None = None
+    failed_count: int | None = None
+
+
+@dataclass
+class ValidationArtifacts:
+    valid_row_indexes: list[int]
+    errors: list[dict[str, Any]]
+    transcript_sources: list[str]
+    custom_metadata_columns: list[str]
+    gates: list[QuickValidationGate]
+    import_allowed: bool
+
+
+class UploadService:
+    def __init__(self, db: Session):
+        self.db = db
+        self.upload_repo = UploadRepository(db)
+        self.task_repo = TaskRepository(db)
+        self.audio_resolver = AudioResolver()
+
+    def upload_excel(self, file: UploadFile, current_user: User) -> UploadFileResponse:
+        if not file.filename:
+            raise ServiceError("File name is required")
+        suffix = Path(file.filename).suffix.lower()
+        if suffix not in {".xlsx", ".xls"}:
+            raise ServiceError("Only .xlsx/.xls files are supported", status_code=422)
+
+        content = file.file.read()
+        if not content:
+            raise ServiceError("Uploaded file is empty", status_code=422)
+
+        stored_name = f"{uuid.uuid4()}{suffix}"
+        destination = settings.upload_path / stored_name
+        destination.write_bytes(content)
+
+        upload_file = self.upload_repo.create_upload_file(
+            original_filename=file.filename,
+            stored_path=str(destination),
+            content_type=file.content_type,
+            uploaded_by_id=current_user.id,
+        )
+        upload_job = self.upload_repo.create_upload_job(
+            upload_file_id=upload_file.id,
+            created_by_id=current_user.id,
+        )
+        self.db.commit()
+        return UploadFileResponse(
+            id=upload_file.id,
+            upload_job_id=upload_job.id,
+            filename=upload_file.original_filename,
+            status=upload_job.status,
+        )
+
+    def preview_upload(self, upload_job_id: str) -> PreviewResponse:
+        job = self.upload_repo.get_upload_job(upload_job_id)
+        if not job:
+            raise ServiceError("Upload job not found", status_code=404)
+        df = self._load_job_dataframe(job)
+        columns, sample_rows, row_count = dataframe_preview(df, limit=25)
+        self.upload_repo.update_upload_job(job, preview_row_count=row_count)
+        self.db.commit()
+        return PreviewResponse(
+            upload_job_id=upload_job_id,
+            columns=columns,
+            sample_rows=sample_rows,
+            row_count=row_count,
+        )
+
+    def validate_upload(
+        self,
+        upload_job_id: str,
+        mapping: ColumnMappingRequest,
+    ) -> UploadValidationResult:
+        job = self.upload_repo.get_upload_job(upload_job_id)
+        if not job:
+            raise ServiceError("Upload job not found", status_code=404)
+        df = self._load_job_dataframe(job)
+        validation = self._validate_dataframe(df, mapping)
+
+        self.upload_repo.clear_job_errors(upload_job_id)
+        self.upload_repo.add_job_errors(upload_job_id, validation.errors)
+        status = (
+            UploadJobStatusEnum.VALIDATED
+            if not validation.errors and validation.import_allowed
+            else UploadJobStatusEnum.VALIDATION_FAILED
+        )
+        self.upload_repo.update_upload_job(
+            job,
+            status=status,
+            mapping_json=mapping.model_dump(),
+            validated=True,
+            preview_row_count=len(df.index),
+        )
+        self.db.commit()
+        return UploadValidationResult(
+            upload_job_id=upload_job_id,
+            status=status,
+            valid_rows=len(validation.valid_row_indexes),
+            invalid_rows=len({error["row_number"] for error in validation.errors}),
+            total_rows=len(df.index),
+            transcript_sources=validation.transcript_sources,
+            custom_metadata_columns=validation.custom_metadata_columns,
+            import_allowed=validation.import_allowed,
+            gates=[ValidationGateResult(**gate.__dict__) for gate in validation.gates],
+            errors=[RowValidationError(**error) for error in validation.errors],
+        )
+
+    def import_upload(self, upload_job_id: str, mapping: ColumnMappingRequest | None = None) -> UploadImportResult:
+        job = self.upload_repo.get_upload_job(upload_job_id)
+        if not job:
+            raise ServiceError("Upload job not found", status_code=404)
+        if not mapping:
+            if not job.mapping_json:
+                raise ServiceError("Mapping is required before import", status_code=422)
+            mapping = ColumnMappingRequest.model_validate(job.mapping_json)
+
+        df = self._load_job_dataframe(job)
+        validation = self._validate_dataframe(df, mapping)
+
+        if not validation.import_allowed:
+            failed_gates = [gate for gate in validation.gates if gate.status == "fail"]
+            gate_errors = [
+                {
+                    "row_number": 1,
+                    "field_name": "validation_gate",
+                    "error_message": gate.message,
+                    "raw_value": gate.gate_key,
+                }
+                for gate in failed_gates
+            ]
+            all_errors = [*validation.errors, *gate_errors]
+            self.upload_repo.clear_job_errors(upload_job_id)
+            self.upload_repo.add_job_errors(upload_job_id, all_errors)
+            self.upload_repo.update_upload_job(
+                job,
+                status=UploadJobStatusEnum.IMPORT_FAILED,
+                mapping_json=mapping.model_dump(),
+                validated=True,
+                imported=False,
+                preview_row_count=len(df.index),
+            )
+            self.db.commit()
+            raise ServiceError(
+                "Import blocked by validation gates",
+                status_code=422,
+                extra={
+                    "failed_gates": [gate.__dict__ for gate in failed_gates],
+                },
+            )
+
+        all_errors = list(validation.errors)
+        imported = 0
+        skipped = 0
+
+        self.upload_repo.clear_job_errors(upload_job_id)
+
+        for idx in validation.valid_row_indexes:
+            row = df.iloc[idx].to_dict()
+            row_number = idx + 2
+            try:
+                with self.db.begin_nested():
+                    self._import_single_row(upload_job_id, row, mapping, actor_user_id=job.created_by_id)
+                imported += 1
+            except IntegrityError:
+                skipped += 1
+                all_errors.append(
+                    {
+                        "row_number": row_number,
+                        "field_name": "id",
+                        "error_message": "Duplicate task id for this upload job",
+                        "raw_value": str(normalize_cell(row.get(mapping.id_column))),
+                    }
+                )
+            except ServiceError as exc:
+                skipped += 1
+                all_errors.append(
+                    {
+                        "row_number": row_number,
+                        "field_name": None,
+                        "error_message": exc.message,
+                        "raw_value": None,
+                    }
+                )
+
+        self.upload_repo.add_job_errors(upload_job_id, all_errors)
+        status = UploadJobStatusEnum.IMPORTED if imported > 0 else UploadJobStatusEnum.IMPORT_FAILED
+        self.upload_repo.update_upload_job(
+            job,
+            status=status,
+            mapping_json=mapping.model_dump(),
+            imported=True,
+            validated=True,
+            preview_row_count=len(df.index),
+        )
+        self.db.commit()
+        return UploadImportResult(
+            upload_job_id=upload_job_id,
+            imported_tasks=imported,
+            skipped_rows=len({error["row_number"] for error in all_errors}),
+            status=status,
+        )
+
+    def list_upload_errors(self, upload_job_id: str) -> list[RowValidationError]:
+        job = self.upload_repo.get_upload_job(upload_job_id)
+        if not job:
+            raise ServiceError("Upload job not found", status_code=404)
+        errors = self.upload_repo.list_job_errors(upload_job_id)
+        return [RowValidationError.model_validate(error, from_attributes=True) for error in errors]
+
+    def _load_job_dataframe(self, job) -> Any:
+        file_path = Path(job.upload_file.stored_path)
+        try:
+            return load_excel_as_dataframe(file_path.read_bytes(), file_path.suffix.lower())
+        except Exception as exc:
+            raise ServiceError("Unable to read Excel file", status_code=422) from exc
+
+    def _validate_dataframe(self, df, mapping: ColumnMappingRequest) -> ValidationArtifacts:
+        columns = set(str(col) for col in df.columns.tolist())
+        missing_columns = []
+
+        required_columns = [mapping.id_column, mapping.file_location_column]
+        required_columns.extend([item.column_name for item in mapping.transcript_columns])
+        optional_columns = [
+            mapping.final_transcript_column,
+            mapping.notes_column,
+            mapping.status_column,
+            *mapping.core_metadata_columns.values(),
+        ]
+        for col in required_columns + [c for c in optional_columns if c]:
+            if col and col not in columns:
+                missing_columns.append(col)
+
+        if missing_columns:
+            raise ServiceError(
+                "Mapped columns not found in file",
+                status_code=422,
+                extra={"missing_columns": sorted(set(missing_columns))},
+            )
+
+        invalid_core = set(mapping.core_metadata_columns.keys()) - ALLOWED_CORE_METADATA_FIELDS
+        if invalid_core:
+            raise ServiceError(
+                "Unsupported core metadata fields in mapping",
+                status_code=422,
+                extra={"invalid_fields": sorted(invalid_core)},
+            )
+
+        transcript_sources = [item.source_key for item in mapping.transcript_columns]
+        mapped_columns = set(required_columns)
+        mapped_columns.update(c for c in optional_columns if c)
+
+        if mapping.custom_metadata_columns is not None:
+            custom_metadata_columns = list(mapping.custom_metadata_columns)
+            missing_columns.extend(col for col in custom_metadata_columns if col not in columns)
+        else:
+            custom_metadata_columns = [col for col in columns if col not in mapped_columns]
+
+        if missing_columns:
+            raise ServiceError(
+                "Mapped columns not found in file",
+                status_code=422,
+                extra={"missing_columns": sorted(set(missing_columns))},
+            )
+
+        errors: list[dict[str, Any]] = []
+        valid_indexes: list[int] = []
+        seen_ids: set[str] = set()
+        non_empty_transcript_by_source: dict[str, int] = {item.source_key: 0 for item in mapping.transcript_columns}
+        rows_with_any_transcript = 0
+        audio_locations_for_sampling: list[str] = []
+
+        for idx, row in df.iterrows():
+            row_number = idx + 2
+            row_obj = row.to_dict()
+            row_errors = []
+
+            external_id = str(normalize_cell(row_obj.get(mapping.id_column, ""))).strip()
+            file_location = str(normalize_cell(row_obj.get(mapping.file_location_column, ""))).strip()
+            if not external_id:
+                row_errors.append(("id", "ID is required", ""))
+            if not file_location:
+                row_errors.append(("file_location", "file_location is required", ""))
+            else:
+                audio_locations_for_sampling.append(file_location)
+            if external_id:
+                if external_id in seen_ids:
+                    row_errors.append(("id", "Duplicate ID in uploaded file", external_id))
+                else:
+                    seen_ids.add(external_id)
+
+            transcript_values = []
+            for transcript_map in mapping.transcript_columns:
+                value = str(normalize_cell(row_obj.get(transcript_map.column_name, ""))).strip()
+                transcript_values.append(value)
+                if value:
+                    non_empty_transcript_by_source[transcript_map.source_key] += 1
+            if any(transcript_values):
+                rows_with_any_transcript += 1
+            else:
+                row_errors.append(("transcript", "At least one transcript value is required", ""))
+
+            if mapping.status_column:
+                raw_status = str(normalize_cell(row_obj.get(mapping.status_column, ""))).strip()
+                if raw_status and raw_status not in {status.value for status in TaskStatusEnum}:
+                    row_errors.append(("status", "Invalid annotation status", raw_status))
+
+            duration_column = mapping.core_metadata_columns.get("duration_seconds")
+            if duration_column:
+                raw_duration = str(normalize_cell(row_obj.get(duration_column, ""))).strip()
+                if raw_duration:
+                    try:
+                        Decimal(raw_duration)
+                    except InvalidOperation:
+                        row_errors.append(("duration_seconds", "Duration must be numeric", raw_duration))
+
+            if row_errors:
+                for field_name, message, raw in row_errors:
+                    errors.append(
+                        {
+                            "row_number": row_number,
+                            "field_name": field_name,
+                            "error_message": message,
+                            "raw_value": raw,
+                        }
+                    )
+            else:
+                valid_indexes.append(idx)
+
+        gates = self._evaluate_quick_validation_gates(
+            row_count=len(df.index),
+            mapping=mapping,
+            non_empty_transcript_by_source=non_empty_transcript_by_source,
+            rows_with_any_transcript=rows_with_any_transcript,
+            audio_locations=audio_locations_for_sampling,
+        )
+        import_allowed = not any(gate.status == "fail" for gate in gates)
+
+        return ValidationArtifacts(
+            valid_row_indexes=valid_indexes,
+            errors=errors,
+            transcript_sources=transcript_sources,
+            custom_metadata_columns=custom_metadata_columns,
+            gates=gates,
+            import_allowed=import_allowed,
+        )
+
+    def _evaluate_quick_validation_gates(
+        self,
+        *,
+        row_count: int,
+        mapping: ColumnMappingRequest,
+        non_empty_transcript_by_source: dict[str, int],
+        rows_with_any_transcript: int,
+        audio_locations: list[str],
+    ) -> list[QuickValidationGate]:
+        gates: list[QuickValidationGate] = []
+
+        empty_sources = [
+            transcript_map.source_key
+            for transcript_map in mapping.transcript_columns
+            if non_empty_transcript_by_source.get(transcript_map.source_key, 0) == 0
+        ]
+        gates.append(
+            QuickValidationGate(
+                gate_key="transcript_columns_have_content",
+                status=(
+                    "fail"
+                    if empty_sources
+                    else "pass"
+                ),
+                message=(
+                    f"Mapped transcript columns with no content: {', '.join(empty_sources)}."
+                    if empty_sources
+                    else "Each mapped transcript source has at least one non-empty transcript value."
+                ),
+                checked_count=len(mapping.transcript_columns),
+                failed_count=len(empty_sources),
+            )
+        )
+
+        transcript_ratio = (rows_with_any_transcript / row_count) if row_count else 0.0
+        transcript_ratio_percentage = round(transcript_ratio * 100, 1)
+        ratio_status: GateStatus = (
+            "fail"
+            if transcript_ratio < 0.5
+            else "warning"
+            if transcript_ratio < MIN_ROWS_WITH_ANY_TRANSCRIPT_RATIO
+            else "pass"
+        )
+        gates.append(
+            QuickValidationGate(
+                gate_key="rows_have_any_transcript",
+                status=ratio_status,
+                message=(
+                    f"{rows_with_any_transcript}/{row_count} rows have at least one transcript ({transcript_ratio_percentage}%)."
+                ),
+                checked_count=row_count,
+                failed_count=row_count - rows_with_any_transcript,
+            )
+        )
+
+        gates.append(self._evaluate_audio_location_gate(audio_locations))
+        return gates
+
+    def _evaluate_audio_location_gate(self, audio_locations: list[str]) -> QuickValidationGate:
+        sampled_locations = list(dict.fromkeys(audio_locations))[:AUDIO_VALIDATION_SAMPLE_SIZE]
+        if not sampled_locations:
+            return QuickValidationGate(
+                gate_key="audio_location_sample",
+                status="fail",
+                message="No audio locations available to validate.",
+                checked_count=0,
+                failed_count=0,
+            )
+
+        checked_count = 0
+        failed_count = 0
+        unverified_s3_count = 0
+
+        for location in sampled_locations:
+            resolved_location = self.audio_resolver.resolve(location)
+            if resolved_location.scheme == "s3" and not self.audio_resolver.can_validate_s3():
+                unverified_s3_count += 1
+                continue
+
+            checked_count += 1
+            if not self.audio_resolver.location_exists(resolved_location):
+                failed_count += 1
+
+        if checked_count == 0 and unverified_s3_count > 0:
+            return QuickValidationGate(
+                gate_key="audio_location_sample",
+                status="warning",
+                message=(
+                    f"Skipped audio existence check for {unverified_s3_count} sampled S3 locations "
+                    "because S3 validation is not configured."
+                ),
+                checked_count=0,
+                failed_count=0,
+            )
+
+        failure_ratio = (failed_count / checked_count) if checked_count else 1.0
+        status: GateStatus
+        if failure_ratio >= AUDIO_VALIDATION_FAIL_RATIO:
+            status = "fail"
+        elif failed_count > 0:
+            status = "warning"
+        else:
+            status = "pass"
+
+        unverified_suffix = (
+            f" {unverified_s3_count} sampled S3 locations were not verified."
+            if unverified_s3_count
+            else ""
+        )
+        return QuickValidationGate(
+            gate_key="audio_location_sample",
+            status=status,
+            message=(
+                f"Sampled {len(sampled_locations)} audio locations; "
+                f"{failed_count} of {checked_count} checked locations were unreachable."
+                f"{unverified_suffix}"
+            ),
+            checked_count=checked_count,
+            failed_count=failed_count,
+        )
+
+    def _import_single_row(
+        self,
+        upload_job_id: str,
+        row: dict[str, Any],
+        mapping: ColumnMappingRequest,
+        actor_user_id: str,
+    ) -> None:
+        external_id = str(normalize_cell(row.get(mapping.id_column, ""))).strip()
+        file_location = str(normalize_cell(row.get(mapping.file_location_column, ""))).strip()
+
+        status = TaskStatusEnum.NOT_STARTED
+        if mapping.status_column:
+            raw_status = str(normalize_cell(row.get(mapping.status_column, ""))).strip()
+            if raw_status:
+                status = TaskStatusEnum(raw_status)
+
+        duration_value = None
+        duration_column = mapping.core_metadata_columns.get("duration_seconds")
+        if duration_column:
+            raw_duration = str(normalize_cell(row.get(duration_column, ""))).strip()
+            if raw_duration:
+                duration_value = Decimal(raw_duration)
+
+        mapped_columns = {
+            mapping.id_column,
+            mapping.file_location_column,
+            *[item.column_name for item in mapping.transcript_columns],
+        }
+        optional = [
+            mapping.final_transcript_column,
+            mapping.notes_column,
+            mapping.status_column,
+            *mapping.core_metadata_columns.values(),
+        ]
+        mapped_columns.update(c for c in optional if c)
+
+        custom_columns = mapping.custom_metadata_columns
+        if custom_columns is None:
+            custom_columns = [str(k) for k in row.keys() if str(k) not in mapped_columns]
+
+        custom_metadata = {
+            column: normalize_cell(row.get(column))
+            for column in custom_columns
+            if str(normalize_cell(row.get(column))).strip() != ""
+        }
+        original_row = {str(k): normalize_cell(v) for k, v in row.items()}
+
+        task = self.task_repo.create_task(
+            upload_job_id=upload_job_id,
+            external_id=external_id,
+            file_location=file_location,
+            final_transcript=(
+                str(normalize_cell(row.get(mapping.final_transcript_column))).strip()
+                if mapping.final_transcript_column
+                else ""
+            ),
+            notes=(
+                str(normalize_cell(row.get(mapping.notes_column))).strip() if mapping.notes_column else None
+            ),
+            status=status,
+            speaker_gender=(
+                str(normalize_cell(row.get(mapping.core_metadata_columns.get("speaker_gender")))).strip()
+                if mapping.core_metadata_columns.get("speaker_gender")
+                else None
+            ),
+            speaker_role=(
+                str(normalize_cell(row.get(mapping.core_metadata_columns.get("speaker_role")))).strip()
+                if mapping.core_metadata_columns.get("speaker_role")
+                else None
+            ),
+            language=(
+                str(normalize_cell(row.get(mapping.core_metadata_columns.get("language")))).strip()
+                if mapping.core_metadata_columns.get("language")
+                else None
+            ),
+            channel=(
+                str(normalize_cell(row.get(mapping.core_metadata_columns.get("channel")))).strip()
+                if mapping.core_metadata_columns.get("channel")
+                else None
+            ),
+            duration_seconds=duration_value,
+            custom_metadata=custom_metadata,
+            original_row=original_row,
+        )
+
+        variants = []
+        for transcript_map in mapping.transcript_columns:
+            transcript_text = str(normalize_cell(row.get(transcript_map.column_name, ""))).strip()
+            if transcript_text:
+                variants.append(
+                    {
+                        "source_key": transcript_map.source_key,
+                        "source_label": transcript_map.source_label or transcript_map.source_key,
+                        "transcript_text": transcript_text,
+                    }
+                )
+        if not variants:
+            raise ServiceError("No transcript variants available for row")
+        self.task_repo.add_transcript_variants(task_id=task.id, variants=variants)
+
+        self.task_repo.add_status_history(
+            task_id=task.id,
+            old_status=None,
+            new_status=task.status,
+            changed_by_id=actor_user_id,
+            comment="Task imported from Excel",
+        )

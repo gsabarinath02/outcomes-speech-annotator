@@ -1,0 +1,154 @@
+import uuid
+from datetime import UTC, datetime
+from decimal import Decimal
+from typing import Any
+
+from sqlalchemy import (
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    JSON,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.models.base import Base, TimestampMixin
+from app.models.enums import TaskStatusEnum
+
+
+def enum_values(enum_cls):
+    return [item.value for item in enum_cls]
+
+
+class AnnotationTask(Base, TimestampMixin):
+    __tablename__ = "annotation_tasks"
+    __table_args__ = (
+        UniqueConstraint("upload_job_id", "external_id", name="uq_annotation_tasks_upload_external"),
+        Index("ix_annotation_tasks_status", "status"),
+        Index("ix_annotation_tasks_assignee_id", "assignee_id"),
+        Index("ix_annotation_tasks_last_tagger_id", "last_tagger_id"),
+        Index("ix_annotation_tasks_updated_at", "updated_at"),
+        Index("ix_annotation_tasks_custom_metadata_gin", "custom_metadata", postgresql_using="gin"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    external_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    upload_job_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("upload_jobs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    file_location: Mapped[str] = mapped_column(Text, nullable=False)
+    final_transcript: Mapped[str | None] = mapped_column(Text, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[TaskStatusEnum] = mapped_column(
+        Enum(TaskStatusEnum, name="task_status_enum", values_callable=enum_values),
+        default=TaskStatusEnum.NOT_STARTED,
+        nullable=False,
+    )
+
+    speaker_gender: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    speaker_role: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    language: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    channel: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    duration_seconds: Mapped[Decimal | None] = mapped_column(Numeric(10, 3), nullable=True)
+
+    custom_metadata: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    original_row: Mapped[dict] = mapped_column(JSON, nullable=False)
+    pii_annotations: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
+
+    assignee_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    last_tagger_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    version: Mapped[int] = mapped_column(default=1, nullable=False)
+    last_saved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    upload_job = relationship("UploadJob", back_populates="tasks")
+    assignee = relationship("User", back_populates="assigned_tasks", foreign_keys=[assignee_id])
+    last_tagger = relationship("User", foreign_keys=[last_tagger_id])
+    transcript_variants = relationship(
+        "TaskTranscriptVariant", back_populates="task", cascade="all, delete-orphan"
+    )
+    status_history = relationship("TaskStatusHistory", back_populates="task", cascade="all, delete-orphan")
+    audit_logs = relationship("TaskAuditLog", back_populates="task", cascade="all, delete-orphan")
+
+
+class TaskTranscriptVariant(Base):
+    __tablename__ = "task_transcript_variants"
+    __table_args__ = (
+        UniqueConstraint("task_id", "source_key", name="uq_task_transcript_variant_task_source"),
+        Index("ix_task_transcript_variants_task_id", "task_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    task_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("annotation_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    source_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    source_label: Mapped[str] = mapped_column(String(150), nullable=False)
+    transcript_text: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+    task = relationship("AnnotationTask", back_populates="transcript_variants")
+
+
+class TaskStatusHistory(Base):
+    __tablename__ = "task_status_history"
+    __table_args__ = (Index("ix_task_status_history_task_id", "task_id"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    task_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("annotation_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    old_status: Mapped[TaskStatusEnum | None] = mapped_column(
+        Enum(TaskStatusEnum, name="task_status_enum", values_callable=enum_values),
+        nullable=True,
+    )
+    new_status: Mapped[TaskStatusEnum] = mapped_column(
+        Enum(TaskStatusEnum, name="task_status_enum", values_callable=enum_values),
+        nullable=False,
+    )
+    changed_by_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+    task = relationship("AnnotationTask", back_populates="status_history")
+
+
+class TaskAuditLog(Base):
+    __tablename__ = "task_audit_logs"
+    __table_args__ = (Index("ix_task_audit_logs_task_id", "task_id"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    task_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("annotation_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    actor_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    action: Mapped[str] = mapped_column(String(100), nullable=False)
+    changed_fields: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    previous_values: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    new_values: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+    task = relationship("AnnotationTask", back_populates="audit_logs")

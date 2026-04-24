@@ -1,0 +1,211 @@
+from datetime import datetime
+from decimal import Decimal
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
+
+from app.models.enums import TaskStatusEnum
+
+
+class TranscriptVariantResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    source_key: str
+    source_label: str
+    transcript_text: str
+
+
+class TaskListItemResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    external_id: str
+    file_location: str
+    status: TaskStatusEnum
+    assignee_id: str | None
+    assignee_name: str | None
+    assignee_email: str | None
+    last_tagger_id: str | None
+    last_tagger_name: str | None
+    last_tagger_email: str | None
+    updated_at: datetime
+    last_saved_at: datetime | None
+    language: str | None
+    speaker_role: str | None
+    version: int
+
+
+class TaskListResponse(BaseModel):
+    items: list[TaskListItemResponse]
+    page: int
+    page_size: int
+    total: int
+    status_counts: dict[str, int]
+
+
+class PIIAnnotation(BaseModel):
+    id: str = Field(min_length=1, max_length=128)
+    label: str = Field(min_length=1, max_length=64)
+    start: int = Field(ge=0)
+    end: int = Field(ge=1)
+    value: str = Field(min_length=1)
+    source: str | None = Field(default=None, max_length=32)
+    confidence: float | None = Field(default=None, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_span(self) -> "PIIAnnotation":
+        if self.end <= self.start:
+            raise ValueError("end must be greater than start")
+        return self
+
+
+class TaskDetailResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    external_id: str
+    file_location: str
+    final_transcript: str | None
+    notes: str | None
+    status: TaskStatusEnum
+    speaker_gender: str | None
+    speaker_role: str | None
+    language: str | None
+    channel: str | None
+    duration_seconds: Decimal | None
+    custom_metadata: dict[str, Any]
+    original_row: dict[str, Any]
+    pii_annotations: list[PIIAnnotation]
+    assignee_id: str | None
+    assignee_name: str | None
+    assignee_email: str | None
+    last_tagger_id: str | None
+    last_tagger_name: str | None
+    last_tagger_email: str | None
+    version: int
+    created_at: datetime
+    updated_at: datetime
+    last_saved_at: datetime | None
+    transcript_variants: list[TranscriptVariantResponse]
+    prev_task_id: str | None = None
+    next_task_id: str | None = None
+
+    @field_serializer("duration_seconds")
+    def serialize_duration_seconds(self, value: Decimal | None) -> float | None:
+        return float(value) if value is not None else None
+
+
+class TaskPatchResponse(BaseModel):
+    task: TaskDetailResponse
+
+
+class ConflictResponse(BaseModel):
+    detail: str = "Conflict detected. The task has been updated by another user."
+    conflicting_fields: list[str]
+    server_task: TaskDetailResponse
+
+
+class UpdateTranscriptRequest(BaseModel):
+    version: int = Field(ge=1)
+    final_transcript: str
+
+
+class UpdateMetadataRequest(BaseModel):
+    version: int = Field(ge=1)
+    speaker_gender: str | None = None
+    speaker_role: str | None = None
+    language: str | None = None
+    channel: str | None = None
+    duration_seconds: Decimal | None = None
+    custom_metadata: dict[str, Any] | None = None
+
+
+class UpdateNotesRequest(BaseModel):
+    version: int = Field(ge=1)
+    notes: str | None = None
+
+
+class UpdateStatusRequest(BaseModel):
+    version: int = Field(ge=1)
+    status: TaskStatusEnum
+    comment: str | None = None
+
+
+class UpdatePIIAnnotationsRequest(BaseModel):
+    version: int = Field(ge=1)
+    pii_annotations: list[PIIAnnotation]
+
+
+class UpdateAssigneeRequest(BaseModel):
+    version: int = Field(ge=1)
+    assignee_id: str | None = None
+
+
+class CombinedTaskUpdateRequest(BaseModel):
+    version: int = Field(ge=1)
+    final_transcript: str | None = None
+    notes: str | None = None
+    status: TaskStatusEnum | None = None
+    comment: str | None = None
+    speaker_gender: str | None = None
+    speaker_role: str | None = None
+    language: str | None = None
+    channel: str | None = None
+    duration_seconds: Decimal | None = None
+    custom_metadata: dict[str, Any] | None = None
+    pii_annotations: list[PIIAnnotation] | None = None
+
+
+class BulkAssigneeItem(BaseModel):
+    task_id: str
+    version: int = Field(ge=1)
+    assignee_id: str | None = None
+
+
+class BulkAssigneeRequest(BaseModel):
+    assignments: list[BulkAssigneeItem] = Field(min_length=1, max_length=200)
+
+
+class BulkAssigneeError(BaseModel):
+    task_id: str
+    status_code: int
+    message: str
+
+
+class BulkAssigneeUpdated(BaseModel):
+    task: TaskDetailResponse
+
+
+class BulkAssigneeResponse(BaseModel):
+    updated: list[BulkAssigneeUpdated]
+    errors: list[BulkAssigneeError]
+
+
+class TaskActivityItem(BaseModel):
+    id: str
+    type: str
+    action: str
+    actor_user_id: str | None = None
+    actor_email: str | None = None
+    actor_name: str | None = None
+    changed_at: datetime
+    changed_fields: dict[str, Any] = Field(default_factory=dict)
+    previous_values: dict[str, Any] = Field(default_factory=dict)
+    new_values: dict[str, Any] = Field(default_factory=dict)
+    old_status: TaskStatusEnum | None = None
+    new_status: TaskStatusEnum | None = None
+    comment: str | None = None
+
+
+class TaskActivityResponse(BaseModel):
+    items: list[TaskActivityItem]
+
+
+class TaskNextResponse(BaseModel):
+    task_id: str | None
+
+
+class AudioURLResponse(BaseModel):
+    url: str
+    expires_in_seconds: int
