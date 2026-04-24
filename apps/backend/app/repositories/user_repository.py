@@ -1,6 +1,8 @@
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.models.enums import RoleEnum, TaskStatusEnum
+from app.models.task import AnnotationTask
 from app.models.user import User
 
 
@@ -15,9 +17,54 @@ class UserRepository:
     def get_by_id(self, user_id: str) -> User | None:
         return self.db.get(User, user_id)
 
-    def list_users(self) -> list[User]:
+    def list_users(
+        self,
+        *,
+        search: str | None = None,
+        role: RoleEnum | None = None,
+        is_active: bool | None = None,
+    ) -> list[User]:
         stmt = select(User).order_by(User.full_name.asc())
+        if search:
+            pattern = f"%{search.lower()}%"
+            stmt = stmt.where((User.email.ilike(pattern)) | (User.full_name.ilike(pattern)))
+        if role is not None:
+            stmt = stmt.where(User.role == role)
+        if is_active is not None:
+            stmt = stmt.where(User.is_active == is_active)
         return list(self.db.execute(stmt).scalars().all())
+
+    def assignment_counts_by_user(self, user_ids: list[str]) -> dict[str, dict[str, int]]:
+        if not user_ids:
+            return {}
+        stmt = select(AnnotationTask.assignee_id, AnnotationTask.status).where(
+            AnnotationTask.assignee_id.in_(user_ids)
+        )
+        counts = {
+            user_id: {
+                "assigned_task_count": 0,
+                "open_assigned_task_count": 0,
+                "completed_task_count": 0,
+                "approved_task_count": 0,
+            }
+            for user_id in user_ids
+        }
+        for assignee_id, status in self.db.execute(stmt).all():
+            if assignee_id not in counts:
+                continue
+            counts[assignee_id]["assigned_task_count"] += 1
+            if status != TaskStatusEnum.APPROVED:
+                counts[assignee_id]["open_assigned_task_count"] += 1
+            if status in {
+                TaskStatusEnum.COMPLETED,
+                TaskStatusEnum.NEEDS_REVIEW,
+                TaskStatusEnum.REVIEWED,
+                TaskStatusEnum.APPROVED,
+            }:
+                counts[assignee_id]["completed_task_count"] += 1
+            if status == TaskStatusEnum.APPROVED:
+                counts[assignee_id]["approved_task_count"] += 1
+        return counts
 
     def create(self, *, email: str, full_name: str, password_hash: str, role: str) -> User:
         user = User(email=email.lower(), full_name=full_name, password_hash=password_hash, role=role)

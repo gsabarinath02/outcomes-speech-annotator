@@ -1,5 +1,8 @@
 export type Role = "ADMIN" | "ANNOTATOR" | "REVIEWER";
 
+export type UserStatusFilter = "all" | "active" | "inactive";
+export type AssignmentLoad = "none" | "light" | "normal" | "heavy";
+
 export type TaskStatus =
   | "Not Started"
   | "In Progress"
@@ -37,6 +40,35 @@ export interface PIIAnnotation {
   value: string;
   source: string | null;
   confidence: number | null;
+}
+
+export interface PIILabel {
+  id: string;
+  key: string;
+  display_name: string;
+  color: string;
+  description: string | null;
+  is_active: boolean;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PIILabelCreateRequest {
+  key: string;
+  display_name: string;
+  color?: string;
+  description?: string | null;
+  is_active?: boolean;
+  sort_order?: number | null;
+}
+
+export interface PIILabelUpdateRequest {
+  display_name?: string | null;
+  color?: string | null;
+  description?: string | null;
+  is_active?: boolean | null;
+  sort_order?: number | null;
 }
 
 export interface TaskDetail {
@@ -101,6 +133,13 @@ export interface AdminUser {
   full_name: string;
   role: Role;
   is_active: boolean;
+  last_login_at: string | null;
+  last_activity_at: string | null;
+  assigned_task_count: number;
+  open_assigned_task_count: number;
+  completed_task_count: number;
+  approved_task_count: number;
+  assignment_load: AssignmentLoad;
   created_at: string;
   updated_at: string;
 }
@@ -161,4 +200,91 @@ export interface JobStatus {
   updated_at: string;
   started_at: string | null;
   completed_at: string | null;
+}
+
+export interface MetricsFilters {
+  status: TaskStatus | null;
+  assignee_id: string | null;
+  job_id: string | null;
+  language: string | null;
+  date_from: string | null;
+  date_to: string | null;
+}
+
+export interface MetricsOverview {
+  total_tasks: number;
+  scored_tasks: number;
+  scored_pairs: number;
+  average_wer: number | null;
+  average_cer: number | null;
+  total_pii_annotations: number;
+  low_confidence_annotations: number;
+  overlap_warnings: number;
+}
+
+export interface ModelTranscriptMetric {
+  source_key: string;
+  source_label: string;
+  tasks_scored: number;
+  word_errors: number;
+  reference_words: number;
+  character_errors: number;
+  reference_characters: number;
+  average_wer: number | null;
+  average_cer: number | null;
+}
+
+export interface PIIMetrics {
+  total_annotations: number;
+  average_annotations_per_task: number;
+  low_confidence_annotations: number;
+  overlap_warnings: number;
+  by_label: Record<string, number>;
+  by_source: Record<string, number>;
+}
+
+export interface TaggerMetric {
+  user_id: string | null;
+  user_name: string | null;
+  user_email: string | null;
+  tasks_touched: number;
+  completed_tasks: number;
+  reviewed_tasks: number;
+  approved_tasks: number;
+  pii_annotations: number;
+}
+
+export interface TaskSourceErrorMetric {
+  source_key: string;
+  source_label: string;
+  wer: number | null;
+  cer: number | null;
+  word_errors: number;
+  reference_words: number;
+  character_errors: number;
+  reference_characters: number;
+}
+
+export interface WorstTaskMetric {
+  task_id: string;
+  external_id: string;
+  status: TaskStatus;
+  language: string | null;
+  upload_job_id: string;
+  assignee_name: string | null;
+  last_tagger_name: string | null;
+  max_wer: number | null;
+  average_wer: number | null;
+  source_metrics: TaskSourceErrorMetric[];
+}
+
+export interface AdminMetricsResponse {
+  generated_at: string;
+  filters: MetricsFilters;
+  overview: MetricsOverview;
+  status_counts: Record<string, number>;
+  model_metrics: ModelTranscriptMetric[];
+  pii_metrics: PIIMetrics;
+  tagger_metrics: TaggerMetric[];
+  worst_tasks: WorstTaskMetric[];
 }

@@ -12,7 +12,9 @@ const {
   fetchJob,
   fetchUsers,
   previewUpload,
+  resetUserPassword,
   uploadExcel,
+  updateUser,
   validateUpload,
 } = vi.hoisted(() => ({
   createUser: vi.fn(),
@@ -22,7 +24,9 @@ const {
   fetchJob: vi.fn(),
   fetchUsers: vi.fn(),
   previewUpload: vi.fn(),
+  resetUserPassword: vi.fn(),
   uploadExcel: vi.fn(),
+  updateUser: vi.fn(),
   validateUpload: vi.fn(),
 }));
 
@@ -55,25 +59,35 @@ vi.mock("@/lib/api", () => ({
   fetchJob: (...args: unknown[]) => fetchJob(...args),
   fetchUsers: (...args: unknown[]) => fetchUsers(...args),
   previewUpload: (...args: unknown[]) => previewUpload(...args),
+  resetUserPassword: (...args: unknown[]) => resetUserPassword(...args),
   uploadExcel: (...args: unknown[]) => uploadExcel(...args),
+  updateUser: (...args: unknown[]) => updateUser(...args),
   validateUpload: (...args: unknown[]) => validateUpload(...args),
 }));
 
 describe("AdminUploadPage async export", () => {
   beforeEach(() => {
+    const reviewer = {
+      id: "reviewer-1",
+      email: "reviewer@test.com",
+      full_name: "Reviewer",
+      role: "REVIEWER",
+      is_active: true,
+      last_login_at: new Date().toISOString(),
+      last_activity_at: new Date().toISOString(),
+      assigned_task_count: 8,
+      open_assigned_task_count: 3,
+      completed_task_count: 5,
+      approved_task_count: 2,
+      assignment_load: "light",
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
     fetchUsers.mockResolvedValue({
-      items: [
-        {
-          id: "reviewer-1",
-          email: "reviewer@test.com",
-          full_name: "Reviewer",
-          role: "REVIEWER",
-          is_active: true,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        },
-      ],
+      items: [reviewer],
     });
+    updateUser.mockResolvedValue({ ...reviewer, role: "ADMIN" });
+    resetUserPassword.mockResolvedValue(reviewer);
     enqueueExportJob.mockResolvedValue({ job_id: "job-1", status: "QUEUED" });
     fetchJob.mockResolvedValue({
       id: "job-1",
@@ -99,6 +113,7 @@ describe("AdminUploadPage async export", () => {
   it("enqueues exports with all filter fields", async () => {
     render(<AdminUploadPage />);
     await screen.findByText("Export Annotations");
+    await waitFor(() => expect(screen.getByLabelText("Assignee")).toHaveTextContent("Reviewer"));
 
     fireEvent.change(screen.getByLabelText("Format"), { target: { value: "xlsx" } });
     fireEvent.change(screen.getByLabelText("Status"), { target: { value: "Approved" } });
@@ -122,5 +137,40 @@ describe("AdminUploadPage async export", () => {
       })
     );
     expect(await screen.findByText("COMPLETED")).toBeInTheDocument();
+  });
+
+  it("filters users and performs admin user actions", async () => {
+    render(<AdminUploadPage />);
+    await screen.findByLabelText("Role for reviewer@test.com");
+
+    fireEvent.change(screen.getByLabelText("Search Users"), { target: { value: "reviewer" } });
+    fireEvent.change(screen.getByLabelText("Role Filter"), { target: { value: "REVIEWER" } });
+    fireEvent.change(screen.getByLabelText("Status Filter"), { target: { value: "active" } });
+
+    await waitFor(() =>
+      expect(fetchUsers).toHaveBeenCalledWith("test-token", {
+        search: "reviewer",
+        role: "REVIEWER",
+        status: "active",
+      })
+    );
+
+    fireEvent.change(screen.getByLabelText("Role for reviewer@test.com"), { target: { value: "ADMIN" } });
+    await waitFor(() =>
+      expect(updateUser).toHaveBeenCalledWith("test-token", "reviewer-1", { role: "ADMIN" })
+    );
+
+    fireEvent.click(screen.getByLabelText("Active status for reviewer@test.com"));
+    await waitFor(() =>
+      expect(updateUser).toHaveBeenCalledWith("test-token", "reviewer-1", { is_active: false })
+    );
+
+    fireEvent.change(screen.getByLabelText("Reset password for reviewer@test.com"), {
+      target: { value: "NewPass@123" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Reset" }));
+    await waitFor(() =>
+      expect(resetUserPassword).toHaveBeenCalledWith("test-token", "reviewer-1", "NewPass@123")
+    );
   });
 });

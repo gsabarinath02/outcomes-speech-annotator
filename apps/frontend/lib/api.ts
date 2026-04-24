@@ -1,12 +1,18 @@
 import type {
   AdminUser,
+  AdminMetricsResponse,
   ColumnMappingRequest,
   JobStatus,
   PIIAnnotation,
+  PIILabel,
+  PIILabelCreateRequest,
+  PIILabelUpdateRequest,
+  Role,
   TaskDetail,
   TaskListResponse,
   TaskStatus,
   TokenResponse,
+  UserStatusFilter,
   UploadValidationResult
 } from "@outcomes/shared-types";
 
@@ -162,6 +168,10 @@ export async function claimTask(token: string, taskId: string): Promise<{ task: 
   return request<{ task: TaskDetail }>(`/tasks/${taskId}/claim`, { method: "POST" }, token);
 }
 
+export async function startTask(token: string, taskId: string): Promise<{ task: TaskDetail }> {
+  return request<{ task: TaskDetail }>(`/tasks/${taskId}/start`, { method: "POST" }, token);
+}
+
 export async function claimNextTask(token: string): Promise<{ task: TaskDetail }> {
   return request<{ task: TaskDetail }>("/tasks/next/claim", { method: "POST" }, token);
 }
@@ -297,8 +307,62 @@ export async function bulkAssignTasks(
   );
 }
 
-export async function fetchUsers(token: string): Promise<{ items: AdminUser[] }> {
-  return request<{ items: AdminUser[] }>("/users", { method: "GET" }, token);
+export async function fetchUsers(
+  token: string,
+  params: {
+    search?: string | null;
+    role?: Role | "all" | null;
+    status?: UserStatusFilter | null;
+  } = {}
+): Promise<{ items: AdminUser[] }> {
+  const query = new URLSearchParams();
+  if (params.search) query.set("search", params.search);
+  if (params.role && params.role !== "all") query.set("role", params.role);
+  if (params.status && params.status !== "all") query.set("status", params.status);
+  const suffix = query.toString();
+  return request<{ items: AdminUser[] }>(`/users${suffix ? `?${suffix}` : ""}`, { method: "GET" }, token);
+}
+
+export async function fetchPIILabels(token: string): Promise<{ items: PIILabel[] }> {
+  return request<{ items: PIILabel[] }>("/pii-labels", { method: "GET" }, token);
+}
+
+export async function fetchAdminPIILabels(token: string): Promise<{ items: PIILabel[] }> {
+  return request<{ items: PIILabel[] }>("/pii-labels/admin", { method: "GET" }, token);
+}
+
+export async function createPIILabel(token: string, payload: PIILabelCreateRequest): Promise<PIILabel> {
+  return request<PIILabel>("/pii-labels", { method: "POST", body: JSON.stringify(payload) }, token);
+}
+
+export async function updatePIILabel(
+  token: string,
+  labelId: string,
+  payload: PIILabelUpdateRequest
+): Promise<PIILabel> {
+  return request<PIILabel>(`/pii-labels/${labelId}`, { method: "PATCH", body: JSON.stringify(payload) }, token);
+}
+
+export async function fetchAdminMetrics(
+  token: string,
+  params: {
+    status?: TaskStatus | "All" | null;
+    assigneeId?: string | null;
+    jobId?: string | null;
+    language?: string | null;
+    dateFrom?: string | null;
+    dateTo?: string | null;
+  } = {}
+): Promise<AdminMetricsResponse> {
+  const query = new URLSearchParams();
+  if (params.status && params.status !== "All") query.set("status", params.status);
+  if (params.assigneeId) query.set("assignee_id", params.assigneeId);
+  if (params.jobId) query.set("job_id", params.jobId);
+  if (params.language) query.set("language", params.language);
+  if (params.dateFrom) query.set("date_from", params.dateFrom);
+  if (params.dateTo) query.set("date_to", params.dateTo);
+  const suffix = query.toString();
+  return request<AdminMetricsResponse>(`/metrics/admin${suffix ? `?${suffix}` : ""}`, { method: "GET" }, token);
 }
 
 export async function createUser(
@@ -306,12 +370,33 @@ export async function createUser(
   payload: {
     email: string;
     full_name: string;
-    role: "ADMIN" | "ANNOTATOR" | "REVIEWER";
+    role: Role;
     password: string;
     is_active?: boolean;
   }
 ): Promise<AdminUser> {
   return request<AdminUser>("/users", { method: "POST", body: JSON.stringify(payload) }, token);
+}
+
+export async function updateUser(
+  token: string,
+  userId: string,
+  payload: {
+    full_name?: string;
+    role?: Role;
+    password?: string;
+    is_active?: boolean;
+  }
+): Promise<AdminUser> {
+  return request<AdminUser>(`/users/${userId}`, { method: "PATCH", body: JSON.stringify(payload) }, token);
+}
+
+export async function resetUserPassword(token: string, userId: string, password: string): Promise<AdminUser> {
+  return request<AdminUser>(
+    `/users/${userId}/reset-password`,
+    { method: "POST", body: JSON.stringify({ password }) },
+    token
+  );
 }
 
 export async function uploadExcel(

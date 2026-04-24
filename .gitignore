@@ -31,6 +31,10 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+# Browser test artifacts
+.playwright-cli/
+test-results/
+
 # Local runtime data
 postgres_data/
 redis_data/

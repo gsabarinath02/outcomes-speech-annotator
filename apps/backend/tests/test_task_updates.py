@@ -127,6 +127,33 @@ def test_combined_task_save_noop_does_not_increment_version(client, auth_headers
     assert noop_save.json()["task"]["version"] == detail["version"]
 
 
+def test_first_edit_automatically_starts_not_started_task(client, auth_headers, sample_excel_bytes):
+    task_id = _create_task(client, auth_headers, sample_excel_bytes)
+    detail = client.get(f"/api/v1/tasks/{task_id}", headers=auth_headers["annotator"]).json()
+    assert detail["status"] == "Not Started"
+
+    notes_response = client.patch(
+        f"/api/v1/tasks/{task_id}/notes",
+        headers=auth_headers["annotator"],
+        json={"version": detail["version"], "notes": "Started with first annotation note"},
+    )
+
+    assert notes_response.status_code == 200
+    task = notes_response.json()["task"]
+    assert task["status"] == "In Progress"
+    assert task["version"] == detail["version"] + 1
+
+    activity = client.get(f"/api/v1/tasks/{task_id}/activity", headers=auth_headers["annotator"])
+    assert activity.status_code == 200
+    assert any(
+        item["type"] == "status"
+        and item["old_status"] == "Not Started"
+        and item["new_status"] == "In Progress"
+        and item["comment"] == "Automatically moved to In Progress when work started"
+        for item in activity.json()["items"]
+    )
+
+
 def test_metadata_update_requires_at_least_one_metadata_field(client, auth_headers, sample_excel_bytes):
     task_id = _create_task(client, auth_headers, sample_excel_bytes)
     detail_response = client.get(f"/api/v1/tasks/{task_id}", headers=auth_headers["annotator"])
@@ -301,6 +328,7 @@ def test_unassigned_filter_claim_next_bulk_assignment_and_activity(client, auth_
     assert claim.status_code == 200
     claimed_task = claim.json()["task"]
     assert claimed_task["assignee_email"] == "annotator@test.com"
+    assert claimed_task["status"] == "In Progress"
 
     claim_again = client.post(f"/api/v1/tasks/{task_id}/claim", headers=auth_headers["reviewer"])
     assert claim_again.status_code == 409
@@ -327,6 +355,21 @@ def test_unassigned_filter_claim_next_bulk_assignment_and_activity(client, auth_
     activity_types = {item["type"] for item in activity.json()["items"]}
     assert {"audit", "status"}.issubset(activity_types)
     assert any(item["actor_email"] == "annotator@test.com" for item in activity.json()["items"])
+
+
+def test_start_endpoint_claims_and_marks_task_in_progress(client, auth_headers, sample_excel_bytes):
+    task_id = _create_task(client, auth_headers, sample_excel_bytes)
+
+    start = client.post(f"/api/v1/tasks/{task_id}/start", headers=auth_headers["annotator"])
+
+    assert start.status_code == 200
+    task = start.json()["task"]
+    assert task["assignee_email"] == "annotator@test.com"
+    assert task["status"] == "In Progress"
+
+    repeat_start = client.post(f"/api/v1/tasks/{task_id}/start", headers=auth_headers["annotator"])
+    assert repeat_start.status_code == 200
+    assert repeat_start.json()["task"]["version"] == task["version"]
 
 
 def test_next_claim_and_bulk_assignment_partial_conflicts(client, auth_headers, sample_excel_bytes, seed_users):

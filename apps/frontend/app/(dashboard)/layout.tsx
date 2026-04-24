@@ -5,6 +5,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { useEffect } from "react";
 import clsx from "clsx";
 
+import { AccountSummary } from "@/components/account-summary";
 import { useAuth } from "@/components/auth-provider";
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
@@ -28,7 +29,12 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 
   const links = [
     { href: "/tasks", label: "Tasks" },
-    { href: "/admin/upload", label: "Admin Upload" }
+    ...(user?.role === "ADMIN"
+      ? [
+          { href: "/admin/upload", label: "Admin Upload" },
+          { href: "/admin/metrics", label: "Metrics" },
+        ]
+      : [])
   ];
 
   return (
@@ -62,21 +68,17 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
               </nav>
             </div>
 
-            <div className="flex items-center gap-2">
-              <div className="hidden rounded-xl border border-[#e7ddf3] bg-[#f9f5ff] px-3 py-2 text-right sm:block">
-                <div className="text-xs font-medium text-[#292545]">{user?.full_name}</div>
-                <div className="text-[11px] text-[#6a6485]">{user?.email}</div>
-                <div className="text-[11px] text-[#8f8aa7]">{user?.role}</div>
-              </div>
+            <div className="flex items-center gap-3">
+              <AccountSummary user={user} />
               <button
                 type="button"
                 onClick={() => {
                   logout();
                   router.replace("/login");
                 }}
-                className="oa-btn-secondary px-3 py-1.5 text-sm font-medium"
+                className="oa-btn-secondary px-3.5 py-2 text-sm font-medium"
               >
-                Logout
+                Log out
               </button>
             </div>
           </div>

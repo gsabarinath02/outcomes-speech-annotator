@@ -54,7 +54,7 @@ export function ConflictModal({
   if (!open || !serverTask) {
     return null;
   }
-  const fields = conflictingFields.length > 0 ? conflictingFields : ["Unknown"];
+  const fields = conflictingFields.length > 0 ? conflictingFields : ["Changed field"];
   const effectiveResolution = Object.fromEntries(fields.map((field) => [field, resolution[field] ?? "mine"]));
 
   return (

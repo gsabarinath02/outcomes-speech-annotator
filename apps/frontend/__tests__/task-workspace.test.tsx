@@ -4,13 +4,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import TaskWorkspacePage from "@/app/(dashboard)/tasks/[taskId]/page";
 
-const { push, fetchTask, fetchAudioURL, fetchTaskActivity, patchTaskCombined } = vi.hoisted(
+const draftKey = "outcomes-ai:speech-annotator:draft:annotator-1:task-1";
+
+const { push, fetchTask, fetchAudioURL, fetchPIILabels, fetchTaskActivity, patchTaskCombined, startTask } = vi.hoisted(
   () => ({
     push: vi.fn(),
     fetchTask: vi.fn(),
     fetchAudioURL: vi.fn(),
+    fetchPIILabels: vi.fn(),
     fetchTaskActivity: vi.fn(),
-    patchTaskCombined: vi.fn()
+    patchTaskCombined: vi.fn(),
+    startTask: vi.fn()
   })
 );
 
@@ -58,7 +62,13 @@ vi.mock("next/navigation", () => ({
 
 vi.mock("@/components/auth-provider", () => ({
   useAuth: () => ({
-    accessToken: "test-token"
+    accessToken: "test-token",
+    user: {
+      id: "annotator-1",
+      email: "annotator@test.com",
+      full_name: "Annotator",
+      role: "ANNOTATOR",
+    },
   })
 }));
 
@@ -74,23 +84,36 @@ vi.mock("@/lib/api", () => ({
   },
   fetchTask: (...args: unknown[]) => fetchTask(...args),
   fetchAudioURL: (...args: unknown[]) => fetchAudioURL(...args),
+  fetchPIILabels: (...args: unknown[]) => fetchPIILabels(...args),
   fetchTaskActivity: (...args: unknown[]) => fetchTaskActivity(...args),
-  patchTaskCombined: (...args: unknown[]) => patchTaskCombined(...args)
+  patchTaskCombined: (...args: unknown[]) => patchTaskCombined(...args),
+  startTask: (...args: unknown[]) => startTask(...args)
 }));
 
 describe("TaskWorkspacePage", () => {
   beforeEach(() => {
-    localStorage.removeItem("outcomes-ai:speech-annotator:draft:anonymous:task-1");
+    localStorage.removeItem(draftKey);
     vi.useRealTimers();
     fetchTask.mockResolvedValue(mockTask);
     fetchAudioURL.mockResolvedValue({ url: "/api/v1/media/audio/token", expires_in_seconds: 300 });
+    fetchPIILabels.mockResolvedValue({ items: [] });
     fetchTaskActivity.mockResolvedValue({ items: [] });
     patchTaskCombined.mockResolvedValue({ task: { ...mockTask, version: 2 } });
+    startTask.mockResolvedValue({
+      task: {
+        ...mockTask,
+        status: "In Progress",
+        assignee_id: "annotator-1",
+        assignee_name: "Annotator",
+        assignee_email: "annotator@test.com",
+        version: 2,
+      },
+    });
   });
 
   afterEach(() => {
     cleanup();
-    localStorage.removeItem("outcomes-ai:speech-annotator:draft:anonymous:task-1");
+    localStorage.removeItem(draftKey);
     vi.useRealTimers();
     vi.clearAllMocks();
   });
@@ -105,6 +128,15 @@ describe("TaskWorkspacePage", () => {
     expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
 
     await waitFor(() => expect(patchTaskCombined).toHaveBeenCalled(), { timeout: 3500 });
+  });
+
+  it("automatically starts not-started tasks when the annotator opens the workspace", async () => {
+    render(<TaskWorkspacePage />);
+
+    await waitFor(() => expect(startTask).toHaveBeenCalledWith("test-token", "task-1"));
+    expect(await screen.findByDisplayValue("In Progress")).toBeInTheDocument();
+    expect(screen.getByText("Assignee: Annotator")).toBeInTheDocument();
+    expect(screen.queryByText("Unsaved changes")).not.toBeInTheDocument();
   });
 
   it("refreshes task details from successful save responses", async () => {
@@ -132,7 +164,7 @@ describe("TaskWorkspacePage", () => {
 
   it("restores matching local drafts to avoid data loss after refresh", async () => {
     localStorage.setItem(
-      "outcomes-ai:speech-annotator:draft:anonymous:task-1",
+      draftKey,
       JSON.stringify({
         schema_version: 1,
         task_id: "task-1",
@@ -262,10 +294,10 @@ describe("TaskWorkspacePage", () => {
     await screen.findByText("Task OUT-001");
 
     act(() => {
-      window.dispatchEvent(new KeyboardEvent("keydown", { key: "2", altKey: true }));
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "3", altKey: true }));
     });
 
-    expect(screen.getByDisplayValue("In Progress")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Completed")).toBeInTheDocument();
 
     await waitFor(() => expect(screen.getByText("Unsaved changes")).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
@@ -274,13 +306,24 @@ describe("TaskWorkspacePage", () => {
       expect(patchTaskCombined).toHaveBeenCalledWith(
         "test-token",
         "task-1",
-        expect.objectContaining({ status: "In Progress" })
+        expect.objectContaining({ status: "Completed" })
       )
     );
   });
 
   it("opens the next task from the keyboard when focus is not in an editor", async () => {
     fetchTask.mockResolvedValueOnce({ ...mockTask, next_task_id: "task-2" });
+    startTask.mockResolvedValueOnce({
+      task: {
+        ...mockTask,
+        status: "In Progress",
+        assignee_id: "annotator-1",
+        assignee_name: "Annotator",
+        assignee_email: "annotator@test.com",
+        next_task_id: "task-2",
+        version: 2,
+      },
+    });
 
     render(<TaskWorkspacePage />);
     await screen.findByText("Task OUT-001");

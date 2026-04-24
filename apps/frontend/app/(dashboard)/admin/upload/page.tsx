@@ -1,6 +1,6 @@
 "use client";
 
-import type { AdminUser, ColumnMappingRequest, JobStatus, Role, TaskStatus } from "@outcomes/shared-types";
+import type { AdminUser, ColumnMappingRequest, JobStatus, Role, TaskStatus, UserStatusFilter } from "@outcomes/shared-types";
 import { useEffect, useMemo, useState } from "react";
 
 import { useAuth } from "@/components/auth-provider";
@@ -13,7 +13,9 @@ import {
   fetchJob,
   fetchUsers,
   previewUpload,
+  resetUserPassword,
   uploadExcel,
+  updateUser,
   validateUpload,
 } from "@/lib/api";
 
@@ -32,6 +34,29 @@ const taskStatuses: Array<TaskStatus | "All"> = [
   "Reviewed",
   "Approved",
 ];
+const roleOptions: Role[] = ["ANNOTATOR", "REVIEWER", "ADMIN"];
+
+function inferTranscriptMaps(columns: string[]): TranscriptMapDraft[] {
+  return columns
+    .filter((column) => /transcript/i.test(column) && !/final|corrected/i.test(column))
+    .map((column) => {
+      const sourceKey = column
+        .replace(/_?transcript$/i, "")
+        .replace(/[^a-zA-Z0-9]+/g, "_")
+        .replace(/^_+|_+$/g, "")
+        .toLowerCase();
+      const sourceLabel = sourceKey
+        .split("_")
+        .filter(Boolean)
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(" ");
+      return {
+        source_key: sourceKey || column,
+        source_label: sourceLabel || column,
+        column_name: column,
+      };
+    });
+}
 
 export default function AdminUploadPage() {
   const { accessToken, user } = useAuth();
@@ -48,9 +73,7 @@ export default function AdminUploadPage() {
   const [languageColumn, setLanguageColumn] = useState("");
   const [channelColumn, setChannelColumn] = useState("");
   const [durationColumn, setDurationColumn] = useState("");
-  const [transcriptMaps, setTranscriptMaps] = useState<TranscriptMapDraft[]>([
-    { source_key: "model_1", source_label: "Model 1", column_name: "model_1_transcript" }
-  ]);
+  const [transcriptMaps, setTranscriptMaps] = useState<TranscriptMapDraft[]>([]);
   const [validationResult, setValidationResult] = useState<Awaited<ReturnType<typeof validateUpload>> | null>(null);
   const [importResult, setImportResult] = useState<Record<string, unknown> | null>(null);
   const [importJob, setImportJob] = useState<JobStatus | null>(null);
@@ -63,10 +86,15 @@ export default function AdminUploadPage() {
   const [exportDateFrom, setExportDateFrom] = useState("");
   const [exportDateTo, setExportDateTo] = useState("");
   const [users, setUsers] = useState<AdminUser[]>([]);
+  const [allUsers, setAllUsers] = useState<AdminUser[]>([]);
+  const [userSearch, setUserSearch] = useState("");
+  const [userRoleFilter, setUserRoleFilter] = useState<Role | "all">("all");
+  const [userStatusFilter, setUserStatusFilter] = useState<UserStatusFilter>("all");
   const [newUserName, setNewUserName] = useState("");
   const [newUserEmail, setNewUserEmail] = useState("");
   const [newUserRole, setNewUserRole] = useState<Role>("ANNOTATOR");
   const [newUserPassword, setNewUserPassword] = useState("");
+  const [resetPasswords, setResetPasswords] = useState<Record<string, string>>({});
   const [userActionMessage, setUserActionMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -136,6 +164,7 @@ export default function AdminUploadPage() {
             ? "duration"
             : ""
       );
+      setTranscriptMaps(inferTranscriptMaps(preview.columns));
     } catch (err) {
       setError(err instanceof APIError ? err.message : "Upload failed");
     } finally {
@@ -237,18 +266,48 @@ export default function AdminUploadPage() {
   const hasImport = Boolean(importResult || importJob?.status === "COMPLETED");
   const validationHasErrors = (validationResult?.errors.length ?? 0) > 0;
   const importBlockedByGates = hasValidation && !(validationResult?.import_allowed ?? true);
+  const userFilterParams = useMemo(
+    () => ({
+      search: userSearch.trim() || null,
+      role: userRoleFilter,
+      status: userStatusFilter,
+    }),
+    [userRoleFilter, userSearch, userStatusFilter]
+  );
+
+  useEffect(() => {
+    if (!accessToken || !canUpload) return;
+    void (async () => {
+      try {
+        const response = await fetchUsers(accessToken, userFilterParams);
+        setUsers(response.items);
+      } catch {
+        setUsers([]);
+      }
+    })();
+  }, [accessToken, canUpload, userFilterParams]);
 
   useEffect(() => {
     if (!accessToken || !canUpload) return;
     void (async () => {
       try {
         const response = await fetchUsers(accessToken);
-        setUsers(response.items);
+        setAllUsers(response.items);
       } catch {
-        setUsers([]);
+        setAllUsers([]);
       }
     })();
   }, [accessToken, canUpload]);
+
+  async function refreshUsers() {
+    if (!accessToken) return;
+    const [filteredResponse, allResponse] = await Promise.all([
+      fetchUsers(accessToken, userFilterParams),
+      fetchUsers(accessToken),
+    ]);
+    setUsers(filteredResponse.items);
+    setAllUsers(allResponse.items);
+  }
 
   async function handleCreateUser() {
     if (!accessToken) return;
@@ -263,7 +322,7 @@ export default function AdminUploadPage() {
         password: newUserPassword,
         is_active: true,
       });
-      setUsers((prev) => [...prev, created].sort((a, b) => a.full_name.localeCompare(b.full_name)));
+      await refreshUsers();
       setUserActionMessage(`Created user ${created.full_name} (${created.role}).`);
       setNewUserName("");
       setNewUserEmail("");
@@ -271,6 +330,40 @@ export default function AdminUploadPage() {
       setNewUserRole("ANNOTATOR");
     } catch (err) {
       setError(err instanceof APIError ? err.message : "User creation failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleUpdateUser(account: AdminUser, payload: { role?: Role; is_active?: boolean }) {
+    if (!accessToken) return;
+    setBusy(true);
+    setError(null);
+    setUserActionMessage(null);
+    try {
+      const updated = await updateUser(accessToken, account.id, payload);
+      await refreshUsers();
+      setUserActionMessage(`Updated ${updated.full_name}.`);
+    } catch (err) {
+      setError(err instanceof APIError ? err.message : "User update failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleResetPassword(account: AdminUser) {
+    if (!accessToken) return;
+    const password = resetPasswords[account.id]?.trim() ?? "";
+    if (password.length < 8) return;
+    setBusy(true);
+    setError(null);
+    setUserActionMessage(null);
+    try {
+      await resetUserPassword(accessToken, account.id, password);
+      setResetPasswords((prev) => ({ ...prev, [account.id]: "" }));
+      setUserActionMessage(`Reset password for ${account.full_name}.`);
+    } catch (err) {
+      setError(err instanceof APIError ? err.message : "Password reset failed");
     } finally {
       setBusy(false);
     }
@@ -302,11 +395,6 @@ export default function AdminUploadPage() {
             <p className="oa-subtext mt-1 text-sm">
               Upload Excel, map columns, validate row-level errors, and import tasks safely.
             </p>
-          </div>
-          <div className="oa-card-soft px-3 py-2 text-xs text-[#6f6a8c]">
-            <p>Signed in as</p>
-            <p className="font-medium text-[#292447]">{user?.full_name}</p>
-            <p>{user?.email}</p>
           </div>
         </div>
 
@@ -351,43 +439,108 @@ export default function AdminUploadPage() {
             </p>
           </div>
           <span className="rounded-md border border-[#e3d8f3] bg-[#f7f1ff] px-2.5 py-1 text-xs text-[#5e597a]">
-            {users.length} users
+            {users.length} matching users
           </span>
         </div>
 
+        <div className="mt-4 grid grid-cols-1 gap-3 rounded-xl border border-[#ece3f7] bg-[#fbf8ff] p-3 md:grid-cols-5">
+          <label className="flex flex-col gap-1.5 md:col-span-2">
+            <span className="text-xs font-medium text-[#676280]">Search Users</span>
+            <input
+              value={userSearch}
+              onChange={(event) => setUserSearch(event.target.value)}
+              placeholder="Name or email"
+              className="oa-input bg-white"
+            />
+          </label>
+          <label className="flex flex-col gap-1.5">
+            <span className="text-xs font-medium text-[#676280]">Role Filter</span>
+            <select
+              value={userRoleFilter}
+              onChange={(event) => setUserRoleFilter(event.target.value as Role | "all")}
+              className="oa-select bg-white"
+            >
+              <option value="all">All roles</option>
+              {roleOptions.map((role) => (
+                <option key={role} value={role}>
+                  {role}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex flex-col gap-1.5">
+            <span className="text-xs font-medium text-[#676280]">Status Filter</span>
+            <select
+              value={userStatusFilter}
+              onChange={(event) => setUserStatusFilter(event.target.value as UserStatusFilter)}
+              className="oa-select bg-white"
+            >
+              <option value="all">All users</option>
+              <option value="active">Active only</option>
+              <option value="inactive">Inactive only</option>
+            </select>
+          </label>
+          <div className="flex items-end">
+            <button
+              type="button"
+              onClick={refreshUsers}
+              disabled={busy}
+              className="oa-btn-secondary w-full px-3.5 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              Refresh
+            </button>
+          </div>
+        </div>
+
         <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-7">
-          <input
-            value={newUserName}
-            onChange={(event) => setNewUserName(event.target.value)}
-            placeholder="Full name"
-            className="oa-input md:col-span-2"
-          />
-          <input
-            value={newUserEmail}
-            onChange={(event) => setNewUserEmail(event.target.value)}
-            placeholder="Work email"
-            className="oa-input md:col-span-2"
-          />
-          <select value={newUserRole} onChange={(event) => setNewUserRole(event.target.value as Role)} className="oa-select">
-            <option value="ANNOTATOR">ANNOTATOR</option>
-            <option value="REVIEWER">REVIEWER</option>
-            <option value="ADMIN">ADMIN</option>
-          </select>
-          <input
-            value={newUserPassword}
-            onChange={(event) => setNewUserPassword(event.target.value)}
-            placeholder="Temporary password"
-            type="password"
-            className="oa-input md:col-span-4"
-          />
-          <button
-            type="button"
-            onClick={handleCreateUser}
-            disabled={!newUserName.trim() || !newUserEmail.trim() || newUserPassword.length < 8 || busy}
-            className="oa-btn-primary px-3.5 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            Create User
-          </button>
+          <label className="flex flex-col gap-1.5 md:col-span-2">
+            <span className="text-xs font-medium text-[#676280]">Full Name</span>
+            <input
+              value={newUserName}
+              onChange={(event) => setNewUserName(event.target.value)}
+              placeholder="Full name"
+              className="oa-input"
+            />
+          </label>
+          <label className="flex flex-col gap-1.5 md:col-span-2">
+            <span className="text-xs font-medium text-[#676280]">Work Email</span>
+            <input
+              value={newUserEmail}
+              onChange={(event) => setNewUserEmail(event.target.value)}
+              placeholder="Work email"
+              className="oa-input"
+            />
+          </label>
+          <label className="flex flex-col gap-1.5">
+            <span className="text-xs font-medium text-[#676280]">Role</span>
+            <select value={newUserRole} onChange={(event) => setNewUserRole(event.target.value as Role)} className="oa-select">
+              {roleOptions.map((role) => (
+                <option key={role} value={role}>
+                  {role}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex flex-col gap-1.5 md:col-span-4">
+            <span className="text-xs font-medium text-[#676280]">Temporary Password</span>
+            <input
+              value={newUserPassword}
+              onChange={(event) => setNewUserPassword(event.target.value)}
+              placeholder="Temporary password"
+              type="password"
+              className="oa-input"
+            />
+          </label>
+          <div className="flex items-end">
+            <button
+              type="button"
+              onClick={handleCreateUser}
+              disabled={!newUserName.trim() || !newUserEmail.trim() || newUserPassword.length < 8 || busy}
+              className="oa-btn-primary w-full px-3.5 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              Create User
+            </button>
+          </div>
         </div>
 
         {userActionMessage ? (
@@ -397,28 +550,102 @@ export default function AdminUploadPage() {
         ) : null}
 
         <div className="mt-4 overflow-auto rounded-xl border border-[#e7ddf3]">
-          <table className="w-full min-w-[680px] text-sm">
+          <table className="w-full min-w-[1180px] text-sm">
             <thead className="border-b border-[#ece2f7] bg-[#faf6ff]">
               <tr>
                 <th className="px-3 py-2 text-left text-xs font-semibold uppercase tracking-[0.08em] text-[#6c6787]">Name</th>
                 <th className="px-3 py-2 text-left text-xs font-semibold uppercase tracking-[0.08em] text-[#6c6787]">Email</th>
                 <th className="px-3 py-2 text-left text-xs font-semibold uppercase tracking-[0.08em] text-[#6c6787]">Role</th>
-                <th className="px-3 py-2 text-left text-xs font-semibold uppercase tracking-[0.08em] text-[#6c6787]">Active</th>
+                <th className="px-3 py-2 text-left text-xs font-semibold uppercase tracking-[0.08em] text-[#6c6787]">Status</th>
+                <th className="px-3 py-2 text-left text-xs font-semibold uppercase tracking-[0.08em] text-[#6c6787]">Assignment Load</th>
+                <th className="px-3 py-2 text-left text-xs font-semibold uppercase tracking-[0.08em] text-[#6c6787]">Task Counts</th>
+                <th className="px-3 py-2 text-left text-xs font-semibold uppercase tracking-[0.08em] text-[#6c6787]">Last Login</th>
+                <th className="px-3 py-2 text-left text-xs font-semibold uppercase tracking-[0.08em] text-[#6c6787]">Last Activity</th>
+                <th className="px-3 py-2 text-left text-xs font-semibold uppercase tracking-[0.08em] text-[#6c6787]">Password</th>
               </tr>
             </thead>
             <tbody>
-              {users.map((account) => (
-                <tr key={account.id} className="border-t border-[#eee5f7]">
-                  <td className="px-3 py-2">{account.full_name}</td>
-                  <td className="px-3 py-2 text-[#645f7d]">{account.email}</td>
-                  <td className="px-3 py-2">{account.role}</td>
-                  <td className="px-3 py-2">{account.is_active ? "Yes" : "No"}</td>
-                </tr>
-              ))}
+              {users.map((account) => {
+                const isCurrentUser = account.id === user?.id;
+                const resetPassword = resetPasswords[account.id] ?? "";
+                return (
+                  <tr key={account.id} className="border-t border-[#eee5f7] align-top">
+                    <td className="px-3 py-2 font-medium text-[#282341]">{account.full_name}</td>
+                    <td className="px-3 py-2 text-[#645f7d]">{account.email}</td>
+                    <td className="px-3 py-2">
+                      <select
+                        aria-label={`Role for ${account.email}`}
+                        value={account.role}
+                        onChange={(event) => handleUpdateUser(account, { role: event.target.value as Role })}
+                        disabled={busy || isCurrentUser}
+                        className="oa-select min-w-[130px] disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {roleOptions.map((role) => (
+                          <option key={role} value={role}>
+                            {role}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
+                    <td className="px-3 py-2">
+                      <label className="inline-flex items-center gap-2 text-sm text-[#403c5d]">
+                        <input
+                          type="checkbox"
+                          aria-label={`Active status for ${account.email}`}
+                          checked={account.is_active}
+                          onChange={(event) => handleUpdateUser(account, { is_active: event.target.checked })}
+                          disabled={busy || isCurrentUser}
+                          className="h-4 w-4 rounded border-[#cfc4df]"
+                        />
+                        {account.is_active ? "Active" : "Inactive"}
+                      </label>
+                    </td>
+                    <td className="px-3 py-2">
+                      <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${assignmentLoadClass(account.assignment_load)}`}>
+                        {account.assignment_load}
+                      </span>
+                      <p className="mt-1 text-xs text-[#6f6a88]">{account.open_assigned_task_count} open</p>
+                    </td>
+                    <td className="px-3 py-2 text-xs text-[#4a4564]">
+                      <p>Assigned: {account.assigned_task_count}</p>
+                      <p>Completed: {account.completed_task_count}</p>
+                      <p>Approved: {account.approved_task_count}</p>
+                    </td>
+                    <td className="px-3 py-2 text-xs text-[#645f7d]">
+                      {formatUserTimestamp(account.last_login_at, "No recorded login")}
+                    </td>
+                    <td className="px-3 py-2 text-xs text-[#645f7d]">
+                      {formatUserTimestamp(account.last_activity_at, "No recorded activity")}
+                    </td>
+                    <td className="px-3 py-2">
+                      <div className="flex min-w-[230px] gap-2">
+                        <input
+                          type="password"
+                          aria-label={`Reset password for ${account.email}`}
+                          value={resetPassword}
+                          onChange={(event) =>
+                            setResetPasswords((prev) => ({ ...prev, [account.id]: event.target.value }))
+                          }
+                          placeholder="New password"
+                          className="oa-input"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => handleResetPassword(account)}
+                          disabled={busy || resetPassword.trim().length < 8}
+                          className="oa-btn-secondary px-3 py-2 text-xs font-medium disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          Reset
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
               {users.length === 0 ? (
                 <tr>
-                  <td className="px-3 py-4 text-center text-sm text-[#7c7795]" colSpan={4}>
-                    No users found.
+                  <td className="px-3 py-4 text-center text-sm text-[#7c7795]" colSpan={9}>
+                    No users match these filters.
                   </td>
                 </tr>
               ) : null}
@@ -463,7 +690,7 @@ export default function AdminUploadPage() {
             <select value={exportAssigneeId} onChange={(event) => setExportAssigneeId(event.target.value)} className="oa-select">
               <option value="all">All</option>
               <option value="unassigned">Unassigned</option>
-              {users.map((account) => (
+              {allUsers.map((account) => (
                 <option key={account.id} value={account.id}>
                   {account.full_name}
                 </option>
@@ -623,8 +850,8 @@ export default function AdminUploadPage() {
                   setTranscriptMaps((prev) => [
                     ...prev,
                     {
-                      source_key: `model_${prev.length + 1}`,
-                      source_label: `Model ${prev.length + 1}`,
+                      source_key: "",
+                      source_label: "",
                       column_name: ""
                     }
                   ])
@@ -897,6 +1124,23 @@ function MetricCard({ label, value }: { label: string; value: number }) {
       <p className="text-base font-semibold text-[#23203f]">{value}</p>
     </div>
   );
+}
+
+function formatUserTimestamp(value: string | null, emptyLabel: string) {
+  if (!value) return emptyLabel;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return emptyLabel;
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(date);
+}
+
+function assignmentLoadClass(load: AdminUser["assignment_load"]) {
+  if (load === "heavy") return "bg-[#ffe7e7] text-[#9a312f]";
+  if (load === "normal") return "bg-[#fff0da] text-[#8b5a17]";
+  if (load === "light") return "bg-[#eafaf0] text-[#236140]";
+  return "bg-[#eeedf5] text-[#5d5875]";
 }
 
 function ColumnSelect({

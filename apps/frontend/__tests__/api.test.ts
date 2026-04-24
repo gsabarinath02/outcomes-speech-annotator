@@ -1,6 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { APIError, fetchTasks, login } from "@/lib/api";
+import {
+  APIError,
+  fetchAdminMetrics,
+  fetchTasks,
+  fetchUsers,
+  login,
+  resetUserPassword,
+  startTask,
+  updateUser,
+} from "@/lib/api";
 import { readSession, writeSession } from "@/lib/session";
 
 describe("API client error handling", () => {
@@ -79,6 +88,102 @@ describe("API client error handling", () => {
     expect(readSession().accessToken).toBeNull();
     expect(readSession().refreshToken).toBeNull();
 
+    fetchMock.mockRestore();
+  });
+
+  it("sends admin metrics filters using backend query names", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          generated_at: new Date().toISOString(),
+          filters: {},
+          overview: {},
+          status_counts: {},
+          model_metrics: [],
+          pii_metrics: {},
+          tagger_metrics: [],
+          worst_tasks: [],
+        }),
+        { status: 200 }
+      )
+    );
+
+    await fetchAdminMetrics("admin-token", {
+      status: "Approved",
+      assigneeId: "unassigned",
+      jobId: "upload-1",
+      language: "en",
+      dateFrom: "2026-04-01",
+      dateTo: "2026-04-24",
+    });
+
+    const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
+    expect(url.pathname).toBe("/api/v1/metrics/admin");
+    expect(url.searchParams.get("status")).toBe("Approved");
+    expect(url.searchParams.get("assignee_id")).toBe("unassigned");
+    expect(url.searchParams.get("job_id")).toBe("upload-1");
+    expect(url.searchParams.get("language")).toBe("en");
+    expect(url.searchParams.get("date_from")).toBe("2026-04-01");
+    expect(url.searchParams.get("date_to")).toBe("2026-04-24");
+
+    fetchMock.mockRestore();
+  });
+
+  it("sends user management filters and update requests", async () => {
+    const userPayload = {
+      id: "user-1",
+      email: "annotator@test.com",
+      full_name: "Annotator",
+      role: "ANNOTATOR",
+      is_active: true,
+      last_login_at: null,
+      last_activity_at: null,
+      assigned_task_count: 0,
+      open_assigned_task_count: 0,
+      completed_task_count: 0,
+      approved_task_count: 0,
+      assignment_load: "none",
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [userPayload] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...userPayload, role: "REVIEWER" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(userPayload), { status: 200 }));
+
+    await fetchUsers("admin-token", {
+      search: "annotator",
+      role: "ANNOTATOR",
+      status: "active",
+    });
+    await updateUser("admin-token", "user-1", { role: "REVIEWER", is_active: false });
+    await resetUserPassword("admin-token", "user-1", "NewPass@123");
+
+    const listUrl = new URL(String(fetchMock.mock.calls[0]?.[0]));
+    expect(listUrl.pathname).toBe("/api/v1/users");
+    expect(listUrl.searchParams.get("search")).toBe("annotator");
+    expect(listUrl.searchParams.get("role")).toBe("ANNOTATOR");
+    expect(listUrl.searchParams.get("status")).toBe("active");
+    expect(fetchMock.mock.calls[1]?.[1]?.method).toBe("PATCH");
+    expect(fetchMock.mock.calls[1]?.[0]).toContain("/api/v1/users/user-1");
+    expect(fetchMock.mock.calls[2]?.[1]?.method).toBe("POST");
+    expect(fetchMock.mock.calls[2]?.[0]).toContain("/api/v1/users/user-1/reset-password");
+
+    fetchMock.mockRestore();
+  });
+
+  it("starts a task through the backend workflow endpoint", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify({ task: { id: "task-1", status: "In Progress" } }), { status: 200 })
+    );
+
+    await expect(startTask("annotator-token", "task-1")).resolves.toMatchObject({
+      task: { id: "task-1", status: "In Progress" },
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toContain("/api/v1/tasks/task-1/start");
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBe("POST");
     fetchMock.mockRestore();
   });
 });
